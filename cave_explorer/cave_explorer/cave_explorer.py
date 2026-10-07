@@ -113,6 +113,9 @@ class CaveExplorer(Node):
         self.get_logger().warn('navigate_to_pose connected')
         self.ready_for_next_goal_ = True
         self.goal_handle_ = None  # active Nav2 goal; kept so it can be cancelled
+        self.last_goal_pose2d_ = None  # most recent goal, kept for retry after a rejection
+        self.retry_timer_ = None
+        self.goal_sent_time_ = None  # when the outstanding goal request was sent; None once answered
         self.declare_parameter('print_feedback', rclpy.Parameter.Type.BOOL)
 
         # Publisher for the goal pose visualisation
@@ -270,6 +273,9 @@ class CaveExplorer(Node):
     def planner_go_to_pose2d(self, pose2d):
         """Go to a provided 2d pose"""
 
+        # Remember the goal so it can be resent if Nav2 rejects it
+        self.last_goal_pose2d_ = pose2d
+
         # Send a goal to navigate_to_pose with self.nav2_action_client_
         action_goal = NavigateToPose.Goal()
         action_goal.pose.header.stamp = self.get_clock().now().to_msg()
@@ -291,13 +297,23 @@ class CaveExplorer(Node):
             action_goal,
             feedback_callback=feedback_method)
         self.send_goal_future_.add_done_callback(self.goal_response_callback)
+        self.goal_sent_time_ = self.get_clock().now()
 
     def goal_response_callback(self, future):
         """The requested goal pose has been sent to the action server"""
 
+        # A request cancelled by the watchdog still calls back: ignore it
+        if future.cancelled():
+            return
+
+        # Nav2 answered, so the watchdog can stand down
+        self.goal_sent_time_ = None
+
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error('Goal rejected')
+            # Nav2 is probably not active yet (startup or restart): resend the same pose shortly
+            self.get_logger().error('Goal rejected, retrying in 2 s')
+            self.retry_timer_ = self.create_timer(2.0, self.retry_goal_callback)
             return
 
         # Goal accepted: keep the handle so the goal can be cancelled, then wait for the result
@@ -330,6 +346,13 @@ class CaveExplorer(Node):
             self.get_logger().error(f'Goal ended with unexpected status {status}')
         self.ready_for_next_goal_ = True
 
+    def retry_goal_callback(self):
+        """Resend the rejected goal once the retry delay has passed"""
+
+        # One-shot: stop the timer so the goal is resent once per rejection
+        self.retry_timer_.cancel()
+        self.destroy_timer(self.retry_timer_)
+        self.planner_go_to_pose2d(self.last_goal_pose2d_)
 
     def planner_move_forwards(self, distance):
         """Simply move forward by the specified distance"""
@@ -425,6 +448,16 @@ class CaveExplorer(Node):
 
         #######################################################
         # Update flags related to the progress of the current planner
+
+        # Watchdog: Nav2 never answered the goal request (e.g. it restarted), so send it again
+        if self.goal_sent_time_ is not None:
+            waited = (self.get_clock().now() - self.goal_sent_time_).nanoseconds * 1e-9
+            if waited > 5.0:
+                self.get_logger().error('No response to goal request, resending')
+                self.send_goal_future_.cancel()
+                self.goal_sent_time_ = None
+                self.planner_go_to_pose2d(self.last_goal_pose2d_)
+                return
 
         # Check if previous goal still running
         if not self.ready_for_next_goal_:
