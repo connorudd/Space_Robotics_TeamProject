@@ -159,8 +159,6 @@ class CaveExplorer(Node):
         else: 
             pose.theta = wrap_angle(-2. * math.acos(qw))
 
-        self.get_logger().warn(f'Pose: {pose}')
-
         return pose
 
     def map_callback(self, map_msg: OccupancyGrid):
@@ -443,7 +441,8 @@ class CaveExplorer(Node):
                 'map',
                 'base_link',
                 rclpy.time.Time()):
-            self.get_logger().warn('Waiting for transform... Have you launched a SLAM node?')
+            self.get_logger().warn('Waiting for the map -> base_link transform (is SLAM running?)',
+                                   throttle_duration_sec=2.0)
             return
 
         #######################################################
