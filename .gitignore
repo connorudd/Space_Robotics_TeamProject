@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# ROS build output
+build/
+install/
+log/
+rosbag2_*/
+
+# Perception dataset and trained models
+dataset/
+*.pt
+*.onnx
+*.h5
+*.tflite
+
+# Run output
+*.log
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Submission archives
+*.zip
