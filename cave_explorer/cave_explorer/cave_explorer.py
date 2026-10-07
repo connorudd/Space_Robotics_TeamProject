@@ -6,6 +6,7 @@ from enum import Enum
 
 import cv2  # OpenCV2
 import rclpy
+from action_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point
 from nav2_msgs.action import NavigateToPose
@@ -111,6 +112,7 @@ class CaveExplorer(Node):
         self.nav2_action_client_.wait_for_server()
         self.get_logger().warn('navigate_to_pose connected')
         self.ready_for_next_goal_ = True
+        self.goal_handle_ = None  # active Nav2 goal; kept so it can be cancelled
         self.declare_parameter('print_feedback', rclpy.Parameter.Type.BOOL)
 
         # Publisher for the goal pose visualisation
@@ -298,8 +300,9 @@ class CaveExplorer(Node):
             self.get_logger().error('Goal rejected')
             return
 
-        # Goal accepted: get result when it's completed
+        # Goal accepted: keep the handle so the goal can be cancelled, then wait for the result
         self.get_logger().warn(f'Goal accepted')
+        self.goal_handle_ = goal_handle
         self.get_result_future_ = goal_handle.get_result_async()
         self.get_result_future_.add_done_callback(self.goal_reached_callback)
 
@@ -311,10 +314,20 @@ class CaveExplorer(Node):
         self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
 
     def goal_reached_callback(self, future):
-        """The requested goal has been reached"""
+        """The requested goal has finished: reached, aborted or cancelled"""
 
-        result = future.result().result
-        self.get_logger().info(f'Goal reached!')
+        status = future.result().status
+        self.goal_handle_ = None
+
+        # Report what actually happened, not just that the goal ended
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('Goal reached!')
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().warn('Goal aborted by Nav2')
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().warn('Goal cancelled')
+        else:
+            self.get_logger().error(f'Goal ended with unexpected status {status}')
         self.ready_for_next_goal_ = True
 
 
