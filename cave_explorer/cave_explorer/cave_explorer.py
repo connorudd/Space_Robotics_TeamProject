@@ -114,7 +114,7 @@ class CaveExplorer(Node):
         self.declare_parameter('print_feedback', rclpy.Parameter.Type.BOOL)
 
         # Publisher for the goal pose visualisation
-        self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose', 1)
+        self.current_goal_pub_ = self.create_publisher(PoseStamped, 'current_goal', 1)
 
         # Subscribe to the map topic to get current bounds
         self.map_sub_ = self.create_subscription(OccupancyGrid, 'map',  self.map_callback, 1)
@@ -275,7 +275,7 @@ class CaveExplorer(Node):
         action_goal.pose.pose = pose2d_to_pose(pose2d)
 
         # Publish visualisation
-        self.goal_pose_vis_.publish(action_goal.pose)
+        self.current_goal_pub_.publish(action_goal.pose)
 
         # Decide whether to show feedback or not
         if self.get_parameter('print_feedback').value:
