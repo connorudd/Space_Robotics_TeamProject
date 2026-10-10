@@ -5,6 +5,7 @@ import random
 from enum import Enum
 
 import cv2  # OpenCV2
+import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
@@ -12,6 +13,7 @@ from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from tf2_ros import TransformException
@@ -20,6 +22,8 @@ from tf2_ros.transform_listener import TransformListener
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
+
+from cave_explorer.frontier_explorer import FrontierExplorer
 
 
 def wrap_angle(angle):
@@ -56,9 +60,9 @@ class PlannerType(Enum):
 
 
 class State(Enum):
-    """Top-level behaviour. Only EXPLORING exists so far; APPROACHING, INSPECTING and
-    RETURN_HOME arrive with Planning 2 and 3."""
+    """Top-level behaviour. APPROACHING, INSPECTING and RETURN_HOME arrive with Planning 2 and 3."""
     EXPLORING = 1
+    DONE = 2       # nothing left to explore
 
 
 class GoalOutcome(Enum):
@@ -166,6 +170,16 @@ class CaveExplorer(Node):
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
+        # Frontier exploration (Planning 1). exploration:=scripted falls back to the template route.
+        self.declare_parameter('exploration', 'frontier')
+        self.frontier_explorer_ = FrontierExplorer(robot_radius=0.5, min_cluster_size=5,
+                                                   blacklist_radius=2.0, max_hole_cells=4)
+        self.map_msg_ = None            # latest /map, planned on when a goal is needed
+        self.visited_goals_ = []        # frontier goals already reached: never sent again
+        self.next_plan_time_ = None     # wait before re-planning when no frontier was usable
+        self.no_frontier_count_ = 0     # plans in a row that found no usable frontier
+        self.planning_marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_planning', 1)
+
         self.set_state(State.EXPLORING, 'startup')
 
         # Timer for main loop
@@ -219,6 +233,9 @@ class CaveExplorer(Node):
         # Set current limits
         self.xlim_ = [map_origin[0], map_origin[0]+map_width*map_resolution]
         self.ylim_ = [map_origin[1], map_origin[1]+map_height*map_resolution]
+
+        # Keep the whole map for frontier planning (only processed when a new goal is needed)
+        self.map_msg_ = map_msg
 
         # self.get_logger().warn('Map received:')
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
@@ -629,15 +646,127 @@ class CaveExplorer(Node):
         self.goal_outcome_ = GoalOutcome.NONE
 
         if self.state_ == State.EXPLORING:
-            self.state_exploring(outcome)
+            if self.get_parameter('exploration').value == 'scripted':
+                self.state_exploring_scripted(outcome)
+            else:
+                self.state_exploring_frontier(outcome)
+        elif self.state_ == State.DONE:
+            self.get_logger().info('Exploration finished, idle', throttle_duration_sec=30.0)
         else:
             # Log instead of crashing: the old destroy_node() here left a dead node spinning
             self.get_logger().error(f'No handler for state {self.state_}', throttle_duration_sec=5.0)
 
-    def state_exploring(self, outcome):
+    def state_exploring_frontier(self, outcome):
         """
-        EXPLORING, for now the template's scripted route: first artifact, home, then random goals.
-        Planning 1 replaces the route with frontier goals; the outcome handling stays.
+        EXPLORING with frontier goals (Planning 1 baseline): go to the nearest frontier by path.
+        Reached goals are remembered as visited, failed goals are blacklisted; neither is chosen again.
+        Three plans in a row without a usable frontier end the exploration.
+        """
+
+        # 1. Account for how the previous goal ended
+        goal = self.last_goal_pose2d_
+        if goal is not None and outcome == GoalOutcome.REACHED:
+            self.consecutive_failures_ = 0
+            self.visited_goals_.append((goal.x, goal.y))
+        elif goal is not None and outcome in (GoalOutcome.ABORTED, GoalOutcome.CANCELLED):
+            self.consecutive_failures_ += 1
+            if (goal.x, goal.y) not in self.blacklist_:   # a stuck-goal cancel has already added it
+                self.blacklist_.append((goal.x, goal.y))
+            self.get_logger().warn(f'Frontier goal [{goal.x:.2f}, {goal.y:.2f}] failed ({outcome.name}), '
+                                   f'blacklisted ({len(self.blacklist_)} total)')
+
+        # 2. Wait for a map, a pose, and any re-plan delay
+        if self.map_msg_ is None:
+            self.get_logger().warn('Waiting for the first map', throttle_duration_sec=5.0)
+            return
+        now = self.get_clock().now()
+        if self.next_plan_time_ is not None and now < self.next_plan_time_:
+            return
+        pose = self.get_pose_2d()
+        if pose is None:
+            return
+
+        # 3. Plan on the latest map
+        info = self.map_msg_.info
+        grid = np.array(self.map_msg_.data, dtype=np.int8).reshape(info.height, info.width)
+        best, frontiers, reason = self.frontier_explorer_.plan(
+            grid, info.resolution, info.origin.position.x, info.origin.position.y,
+            (pose.x, pose.y), blacklist=self.blacklist_ + self.visited_goals_)
+        self.publish_frontier_markers(frontiers, best, info)
+
+        if best is None:
+            self.no_frontier_count_ += 1
+            self.get_logger().warn(f'No frontier goal: {reason} ({self.no_frontier_count_}/3)')
+            if self.no_frontier_count_ >= 3:
+                self.set_state(State.DONE, reason)
+            else:
+                self.next_plan_time_ = now + Duration(seconds=2.0)  # let the map update first
+            return
+
+        # 4. Go there
+        self.no_frontier_count_ = 0
+        gx, gy, yaw = best.goal
+        self.get_logger().info(f'Frontier goal [{gx:.2f}, {gy:.2f}]: {reason}, '
+                               f'cluster of {best.size} cells')
+        self.planner_go_to_pose2d(Pose2D(x=float(gx), y=float(gy), theta=float(yaw)))
+
+    def publish_frontier_markers(self, frontiers, best, info):
+        """RViz: frontier cells by status, the chosen goal, and blacklisted / visited goals"""
+
+        stamp = self.get_clock().now().to_msg()
+        markers = MarkerArray()
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        markers.markers.append(clear)
+
+        def new_marker(ns, marker_id, marker_type, rgb, scale):
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp = stamp
+            m.ns = ns
+            m.id = marker_id
+            m.type = marker_type
+            m.action = Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = scale
+            m.color.r, m.color.g, m.color.b = rgb
+            m.color.a = 1.0
+            return m
+
+        # Frontier cells, one POINTS marker per status (tiny clusters are left out as noise)
+        colours = {'chosen': (0.0, 1.0, 0.0), 'candidate': (0.0, 0.5, 1.0),
+                   'unreachable': (1.0, 0.5, 0.0), 'blacklisted': (0.5, 0.0, 0.0)}
+        for i, (status, rgb) in enumerate(colours.items()):
+            m = new_marker('frontiers', i, Marker.POINTS, rgb, info.resolution)
+            for f in frontiers:
+                if f.status == status:
+                    for r, c in f.cells:
+                        x, y = FrontierExplorer.cell_to_world(r, c, info.origin.position.x,
+                                                              info.origin.position.y, info.resolution)
+                        m.points.append(Point(x=float(x), y=float(y), z=0.1))
+            markers.markers.append(m)
+
+        # Chosen goal as an arrow along its heading
+        if best is not None:
+            m = new_marker('frontier_goal', 0, Marker.ARROW, (1.0, 1.0, 0.0), 1.0)
+            m.scale.y = m.scale.z = 0.25
+            m.pose = pose2d_to_pose(Pose2D(x=float(best.goal[0]), y=float(best.goal[1]), theta=float(best.goal[2])))
+            m.pose.position.z = 0.3
+            markers.markers.append(m)
+
+        # Goals not to be chosen again: blacklisted (red) and visited (grey)
+        for ns, points, rgb in (('blacklisted_goals', self.blacklist_, (1.0, 0.0, 0.0)),
+                                ('visited_goals', self.visited_goals_, (0.6, 0.6, 0.6))):
+            m = new_marker(ns, 0, Marker.SPHERE_LIST, rgb, 0.6)
+            m.points = [Point(x=float(x), y=float(y), z=0.3) for x, y in points]
+            markers.markers.append(m)
+
+        self.planning_marker_pub_.publish(markers)
+
+    def state_exploring_scripted(self, outcome):
+        """
+        EXPLORING with the template's scripted route: first artifact, home, then random goals.
+        Kept as a fallback (exploration:=scripted) and for comparison with the frontier explorer.
         """
 
         # 1. Account for how the previous goal ended
