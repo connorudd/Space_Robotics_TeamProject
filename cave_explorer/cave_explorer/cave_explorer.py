@@ -55,6 +55,20 @@ class PlannerType(Enum):
     # Add more!
 
 
+class State(Enum):
+    """Top-level behaviour. Only EXPLORING exists so far; APPROACHING, INSPECTING and
+    RETURN_HOME arrive with Planning 2 and 3."""
+    EXPLORING = 1
+
+
+class GoalOutcome(Enum):
+    """How the last Nav2 goal ended, for the state handlers to branch on"""
+    NONE = 0       # no goal has ended since the handler last looked
+    REACHED = 1    # arrived, or was cancelled within arrival_slack of the goal
+    ABORTED = 2    # Nav2 gave up, or something else preempted the goal
+    CANCELLED = 3  # cancelled by the stuck-goal check (or by someone else)
+
+
 class CaveExplorer(Node):
     def __init__(self):
         super().__init__('cave_explorer_node')
@@ -67,9 +81,12 @@ class CaveExplorer(Node):
         self.artifact_found_ = False
 
         # Variables/Flags for planning
+        self.state_ = None  # set by set_state() once the node is built
         self.planner_type_ = PlannerType.ERROR
-        self.reached_first_artifact_ = False
-        self.returned_home_ = False
+        self.first_artifact_done_ = False  # reached, or abandoned after repeated failures
+        self.return_home_done_ = False     # reached, or abandoned after repeated failures
+        self.consecutive_failures_ = 0     # goals in a row that were aborted or cancelled
+        self.goal_outcome_ = GoalOutcome.NONE
 
         # Marker for artifact locations
         # See https://wiki.ros.org/rviz/DisplayTypes/Marker
@@ -130,6 +147,10 @@ class CaveExplorer(Node):
         self.last_progress_time_ = None  # node-clock time of the last real progress
         self.cancel_reason_ = None       # set once a cancel has been requested for the active goal
         self.blacklist_ = []             # (x, y) goals given up on, for the planners to avoid
+        # arrival_slack: a goal cancelled this close (m) counts as reached. In run 4 a goal was cancelled
+        # at 0.95 m after 3 recoveries, inside the 1.0 m tolerance, so calling that a failure is wrong.
+        self.declare_parameter('arrival_slack', 1.5)
+        self.cancel_near_goal_ = False   # the cancel was requested close enough to count as arrival
         self.first_distance_ = None      # first distance_remaining of the active goal (for the end-of-goal log)
         self.goal_start_pose_ = None     # robot pose when the active goal was accepted
 
@@ -145,8 +166,17 @@ class CaveExplorer(Node):
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
+        self.set_state(State.EXPLORING, 'startup')
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
+
+    def set_state(self, new_state, reason):
+        """Change the top-level state, logging every transition with its reason"""
+
+        old = self.state_.name if self.state_ is not None else 'none'
+        self.get_logger().info(f'State {old} -> {new_state.name} ({reason})')
+        self.state_ = new_state
     
     def get_pose_2d(self):
         """Get the 2d pose of the robot"""
@@ -286,6 +316,9 @@ class CaveExplorer(Node):
     def planner_go_to_pose2d(self, pose2d):
         """Go to a provided 2d pose"""
 
+        # A goal is now in flight: main_loop waits until goal_reached_callback clears this
+        self.ready_for_next_goal_ = False
+
         # Remember the goal so it can be resent if Nav2 rejects it
         self.last_goal_pose2d_ = pose2d
 
@@ -332,6 +365,7 @@ class CaveExplorer(Node):
         self.best_distance_ = None
         self.last_progress_time_ = self.get_clock().now()
         self.cancel_reason_ = None
+        self.cancel_near_goal_ = False
         self.first_distance_ = None
         self.goal_start_pose_ = self.get_pose_2d()
         self.goal_handle_ = goal_handle
@@ -398,9 +432,17 @@ class CaveExplorer(Node):
         goal = self.last_goal_pose2d_
         feedback = self.last_feedback_
         remaining = f'{feedback.distance_remaining:.2f} m' if feedback is not None else 'unknown distance'
-        self.blacklist_.append((goal.x, goal.y))
-        self.get_logger().warn(f'Cancelling goal [{goal.x:.2f}, {goal.y:.2f}]: {reason}, '
-                               f'{remaining} remaining (blacklisted, {len(self.blacklist_)} total)')
+
+        # Close enough already: count it as reached, and do not blacklist a goal we got to
+        self.cancel_near_goal_ = feedback is not None and \
+            feedback.distance_remaining <= self.get_parameter('arrival_slack').value
+        if self.cancel_near_goal_:
+            self.get_logger().warn(f'Cancelling goal [{goal.x:.2f}, {goal.y:.2f}]: {reason}, '
+                                   f'{remaining} remaining (close enough, counting it as reached)')
+        else:
+            self.blacklist_.append((goal.x, goal.y))
+            self.get_logger().warn(f'Cancelling goal [{goal.x:.2f}, {goal.y:.2f}]: {reason}, '
+                                   f'{remaining} remaining (blacklisted, {len(self.blacklist_)} total)')
 
         # Cancelling stops the robot (the controller publishes zero velocity). Do not use the
         # Nav2 panel's Reset/Pause for this: the robot keeps driving on its last command.
@@ -413,15 +455,22 @@ class CaveExplorer(Node):
         status = future.result().status
         self.goal_handle_ = None
 
-        # Report what actually happened, not just that the goal ended
+        # Report what actually happened, and record it for the state machine to branch on
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Goal reached!')
+            self.goal_outcome_ = GoalOutcome.REACHED
         elif status == GoalStatus.STATUS_ABORTED:
             self.get_logger().warn('Goal aborted by Nav2')
+            self.goal_outcome_ = GoalOutcome.ABORTED
+        elif status == GoalStatus.STATUS_CANCELED and self.cancel_near_goal_:
+            self.get_logger().info('Goal cancelled near the goal: counted as reached')
+            self.goal_outcome_ = GoalOutcome.REACHED
         elif status == GoalStatus.STATUS_CANCELED:
             self.get_logger().warn('Goal cancelled')
+            self.goal_outcome_ = GoalOutcome.CANCELLED
         else:
             self.get_logger().error(f'Goal ended with unexpected status {status}')
+            self.goal_outcome_ = GoalOutcome.ABORTED
 
         # Record how the goal ended, so an abort or cancel can be diagnosed from the log
         feedback = self.last_feedback_
@@ -439,6 +488,7 @@ class CaveExplorer(Node):
                                    f'{feedback.number_of_recoveries} recovery attempt(s)')
         self.last_feedback_ = None
         self.cancel_reason_ = None
+        self.cancel_near_goal_ = False
         self.ready_for_next_goal_ = True
 
     def retry_goal_callback(self):
@@ -506,9 +556,10 @@ class CaveExplorer(Node):
                         [7.9, 13.8],
                         [14.2, 37.7]]
 
-        # Select a random location
+        # Select a random location. Bounded: the old unbounded loop spun forever (blocking the whole
+        # node) if no goal was inside the map bounds, e.g. before the first map arrives.
         goal_valid = False
-        while not goal_valid:
+        for _ in range(50):
             idx = random.randint(0,len(random_goals)-1)
             goal_x = random_goals[idx][0]
             goal_y = random_goals[idx][1]
@@ -517,8 +568,14 @@ class CaveExplorer(Node):
             if goal_x > self.xlim_[0] and goal_x < self.xlim_[1] and \
                goal_y > self.ylim_[0] and goal_y < self.ylim_[1]:
                 goal_valid = True
+                break
             else:
                 self.get_logger().warn(f'Goal [{goal_x}, {goal_y}] out of bounds')
+
+        if not goal_valid:
+            # Send nothing: main_loop stays ready and tries again next tick
+            self.get_logger().warn('No random goal inside the map bounds yet', throttle_duration_sec=5.0)
+            return
 
         goal_pose2d = Pose2D(
             x = goal_x,
@@ -563,48 +620,71 @@ class CaveExplorer(Node):
 
         # Check if previous goal still running
         if not self.ready_for_next_goal_:
-            # self.get_logger().info(f'Previous goal still running')
             return
 
-        self.ready_for_next_goal_ = False
-
-        if self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
-            self.get_logger().info('Successfully reached first artifact!')
-            self.reached_first_artifact_ = True
-        if self.planner_type_ == PlannerType.RETURN_HOME:
-            self.get_logger().info('Successfully returned home!')
-            self.returned_home_ = True
-
         #######################################################
-        # Select the next planner to execute
-        # Update this logic as you see fit!
-        if not self.reached_first_artifact_:
+        # No goal in flight: hand the outcome of the last goal (if any) to the current state.
+        # Each handler decides what to do next; sending a goal makes the node busy again.
+        outcome = self.goal_outcome_
+        self.goal_outcome_ = GoalOutcome.NONE
+
+        if self.state_ == State.EXPLORING:
+            self.state_exploring(outcome)
+        else:
+            # Log instead of crashing: the old destroy_node() here left a dead node spinning
+            self.get_logger().error(f'No handler for state {self.state_}', throttle_duration_sec=5.0)
+
+    def state_exploring(self, outcome):
+        """
+        EXPLORING, for now the template's scripted route: first artifact, home, then random goals.
+        Planning 1 replaces the route with frontier goals; the outcome handling stays.
+        """
+
+        # 1. Account for how the previous goal ended
+        if outcome == GoalOutcome.REACHED:
+            self.consecutive_failures_ = 0
+            if self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
+                self.get_logger().info('Reached first artifact')
+            elif self.planner_type_ == PlannerType.RETURN_HOME:
+                self.get_logger().info('Returned home')
+            self.finish_route_stage()
+        elif outcome in (GoalOutcome.ABORTED, GoalOutcome.CANCELLED):
+            self.consecutive_failures_ += 1
+            self.get_logger().warn(f'{self.planner_type_.name} goal failed ({outcome.name}), '
+                                   f'{self.consecutive_failures_} failure(s) in a row')
+            # A scripted goal gets one retry, then is abandoned so the route cannot stall on it.
+            # Random goals are never retried: the next pick is a different attempt anyway.
+            if self.consecutive_failures_ >= 2 and self.planner_type_ != PlannerType.RANDOM_GOAL:
+                self.get_logger().warn(f'Abandoning {self.planner_type_.name} after '
+                                       f'{self.consecutive_failures_} failures')
+                self.consecutive_failures_ = 0
+                self.finish_route_stage()
+
+        # 2. Choose the next planner (after a single failure this picks the same one: a retry)
+        if not self.first_artifact_done_:
             self.planner_type_ = PlannerType.GO_TO_FIRST_ARTIFACT
-        elif not self.returned_home_:
+        elif not self.return_home_done_:
             self.planner_type_ = PlannerType.RETURN_HOME
         else:
             self.planner_type_ = PlannerType.RANDOM_GOAL
 
-        #######################################################
-        # Execute the planner by calling the relevant method
-        # Add your own planners here!
+        # 3. Run it
         self.get_logger().info(f'Calling planner: {self.planner_type_.name}')
-        if self.planner_type_ == PlannerType.MOVE_FORWARDS:
-            self.planner_move_forwards(10)
-        elif self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
+        if self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
             self.planner_go_to_first_artifact()
         elif self.planner_type_ == PlannerType.RETURN_HOME:
             self.planner_return_home()
-        elif self.planner_type_ == PlannerType.RANDOM_WALK:
-            self.planner_random_walk()
-        elif self.planner_type_ == PlannerType.RANDOM_GOAL:
-            self.planner_random_goal()
         else:
-            self.get_logger().error('No valid planner selected')
-            self.destroy_node()
+            self.planner_random_goal()
 
+    def finish_route_stage(self):
+        """Mark the current scripted stage as done (reached or abandoned)"""
 
-        #######################################################
+        if self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
+            self.first_artifact_done_ = True
+        elif self.planner_type_ == PlannerType.RETURN_HOME:
+            self.return_home_done_ = True
+
 
 def main():
     # Initialise
@@ -613,5 +693,12 @@ def main():
     # Create the cave explorer
     cave_explorer = CaveExplorer()
 
-    while rclpy.ok():
+    # Spin until Ctrl-C, then shut down cleanly
+    try:
         rclpy.spin(cave_explorer)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cave_explorer.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
