@@ -116,7 +116,22 @@ class CaveExplorer(Node):
         self.last_goal_pose2d_ = None  # most recent goal, kept for retry after a rejection
         self.retry_timer_ = None
         self.goal_sent_time_ = None  # when the outstanding goal request was sent; None once answered
-        self.declare_parameter('print_feedback', rclpy.Parameter.Type.BOOL)
+        self.declare_parameter('print_feedback', False)
+
+        # Stuck-goal handling: give up on a goal that goes into recovery or stops making progress
+        # max_recoveries: cancel when Nav2's recovery count exceeds this. Not 0: in the 10 Oct run all 6
+        # first-recovery cancels coincided with a bt_navigator "Timed out while waiting for action
+        # server" warning, which Nav2 retries by itself. Treat 2 as a starting point to tune.
+        self.declare_parameter('max_recoveries', 2)
+        self.declare_parameter('stuck_timeout', 30.0)     # node-clock (sim) seconds without progress
+        self.declare_parameter('progress_epsilon', 0.5)   # metres closer that count as progress
+        self.last_feedback_ = None       # latest NavigateToPose feedback for the active goal
+        self.best_distance_ = None       # smallest distance_remaining seen for the active goal
+        self.last_progress_time_ = None  # node-clock time of the last real progress
+        self.cancel_reason_ = None       # set once a cancel has been requested for the active goal
+        self.blacklist_ = []             # (x, y) goals given up on, for the planners to avoid
+        self.first_distance_ = None      # first distance_remaining of the active goal (for the end-of-goal log)
+        self.goal_start_pose_ = None     # robot pose when the active goal was accepted
 
         # Publisher for the goal pose visualisation
         self.current_goal_pub_ = self.create_publisher(PoseStamped, 'current_goal', 1)
@@ -283,17 +298,12 @@ class CaveExplorer(Node):
         # Publish visualisation
         self.current_goal_pub_.publish(action_goal.pose)
 
-        # Decide whether to show feedback or not
-        if self.get_parameter('print_feedback').value:
-            feedback_method = self.feedback_callback
-        else:
-            feedback_method = None
-
-        # Send goal to action server
+        # Send goal to action server. Feedback is always on: the stuck-goal check needs it.
+        # (print_feedback now only controls whether each feedback message is logged.)
         self.get_logger().warn(f'Sending goal [{pose2d.x:.2f}, {pose2d.y:.2f}]...')
         self.send_goal_future_ = self.nav2_action_client_.send_goal_async(
             action_goal,
-            feedback_callback=feedback_method)
+            feedback_callback=self.feedback_callback)
         self.send_goal_future_.add_done_callback(self.goal_response_callback)
         self.goal_sent_time_ = self.get_clock().now()
 
@@ -316,6 +326,14 @@ class CaveExplorer(Node):
 
         # Goal accepted: keep the handle so the goal can be cancelled, then wait for the result
         self.get_logger().warn(f'Goal accepted')
+        # Start the stuck-goal tracking for this goal (before the handle is set, so the check
+        # in main_loop never sees a handle without a progress time)
+        self.last_feedback_ = None
+        self.best_distance_ = None
+        self.last_progress_time_ = self.get_clock().now()
+        self.cancel_reason_ = None
+        self.first_distance_ = None
+        self.goal_start_pose_ = self.get_pose_2d()
         self.goal_handle_ = goal_handle
         self.get_result_future_ = goal_handle.get_result_async()
         self.get_result_future_.add_done_callback(self.goal_reached_callback)
@@ -323,9 +341,71 @@ class CaveExplorer(Node):
     def feedback_callback(self, feedback_msg):
         """Monitor the feedback from the action server"""
 
-        feedback = feedback_msg.feedback
+        # Ignore late feedback from a goal that has already ended (or not yet accepted)
+        if self.goal_handle_ is None or feedback_msg.goal_id != self.goal_handle_.goal_id:
+            return
 
-        self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
+        feedback = feedback_msg.feedback
+        self.last_feedback_ = feedback
+
+        if self.get_parameter('print_feedback').value:
+            self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
+
+        # Nav2 reports 0 before it has a path: that is not progress, so ignore it
+        distance = feedback.distance_remaining
+        if distance <= 0.0:
+            return
+
+        # The first feedback of a goal is computed from the PREVIOUS goal's path (10 Oct logs: the
+        # first distance of each goal equalled the previous goal's last distance, e.g. 1.0 m for a
+        # goal 20 m away). A path can never be shorter than the straight line from the robot to the
+        # goal, so a shorter distance is stale: ignore it, or it becomes an unbeatable "best distance".
+        pose = self.get_pose_2d()
+        goal = self.last_goal_pose2d_
+        if pose is not None and goal is not None:
+            straight_line = math.hypot(goal.x - pose.x, goal.y - pose.y)
+            if distance < straight_line - 0.5:
+                return
+
+        if self.first_distance_ is None:
+            self.first_distance_ = distance
+
+        # Progress = at least progress_epsilon closer than the best distance so far
+        if self.best_distance_ is None or \
+                distance < self.best_distance_ - self.get_parameter('progress_epsilon').value:
+            self.best_distance_ = distance
+            self.last_progress_time_ = self.get_clock().now()
+
+    def check_goal_stuck(self):
+        """Return a reason string if the active goal should be given up on, otherwise None"""
+
+        # Nav2 has started its recovery behaviours (spin, back up, wait...)
+        feedback = self.last_feedback_
+        if feedback is not None and \
+                feedback.number_of_recoveries > self.get_parameter('max_recoveries').value:
+            return f'{feedback.number_of_recoveries} recovery attempt(s)'
+
+        # No real progress for too long (also fires if feedback stops arriving)
+        idle = (self.get_clock().now() - self.last_progress_time_).nanoseconds * 1e-9
+        if idle > self.get_parameter('stuck_timeout').value:
+            return f'no progress for {idle:.0f} s'
+
+        return None
+
+    def cancel_active_goal(self, reason):
+        """Cancel the active goal, remember it as unreachable, and let the result callback finish up"""
+
+        goal = self.last_goal_pose2d_
+        feedback = self.last_feedback_
+        remaining = f'{feedback.distance_remaining:.2f} m' if feedback is not None else 'unknown distance'
+        self.blacklist_.append((goal.x, goal.y))
+        self.get_logger().warn(f'Cancelling goal [{goal.x:.2f}, {goal.y:.2f}]: {reason}, '
+                               f'{remaining} remaining (blacklisted, {len(self.blacklist_)} total)')
+
+        # Cancelling stops the robot (the controller publishes zero velocity). Do not use the
+        # Nav2 panel's Reset/Pause for this: the robot keeps driving on its last command.
+        self.cancel_reason_ = reason
+        self.goal_handle_.cancel_goal_async()
 
     def goal_reached_callback(self, future):
         """The requested goal has finished: reached, aborted or cancelled"""
@@ -342,6 +422,23 @@ class CaveExplorer(Node):
             self.get_logger().warn('Goal cancelled')
         else:
             self.get_logger().error(f'Goal ended with unexpected status {status}')
+
+        # Record how the goal ended, so an abort or cancel can be diagnosed from the log
+        feedback = self.last_feedback_
+        if feedback is not None:
+            # Path distance went from first_distance_ to remaining; moved is the straight-line
+            # displacement of the robot. Moved far but remaining barely changed = detour, not stuck.
+            first = f'{self.first_distance_:.1f}' if self.first_distance_ is not None else '?'
+            end_pose = self.get_pose_2d()
+            if self.goal_start_pose_ is not None and end_pose is not None:
+                moved = f'{math.hypot(end_pose.x - self.goal_start_pose_.x, end_pose.y - self.goal_start_pose_.y):.1f}'
+            else:
+                moved = '?'
+            self.get_logger().info(f'Goal ended with {feedback.distance_remaining:.2f} m remaining '
+                                   f'(started at {first} m, robot moved {moved} m), '
+                                   f'{feedback.number_of_recoveries} recovery attempt(s)')
+        self.last_feedback_ = None
+        self.cancel_reason_ = None
         self.ready_for_next_goal_ = True
 
     def retry_goal_callback(self):
@@ -457,6 +554,12 @@ class CaveExplorer(Node):
                 self.goal_sent_time_ = None
                 self.planner_go_to_pose2d(self.last_goal_pose2d_)
                 return
+
+        # Stuck-goal check: cancel a goal that is in recovery or has stopped making progress
+        if self.goal_handle_ is not None and self.cancel_reason_ is None:
+            stuck_reason = self.check_goal_stuck()
+            if stuck_reason is not None:
+                self.cancel_active_goal(stuck_reason)
 
         # Check if previous goal still running
         if not self.ready_for_next_goal_:
