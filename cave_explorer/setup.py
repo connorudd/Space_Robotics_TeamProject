@@ -37,6 +37,7 @@ setup(
         'console_scripts': [
             'cave_explorer = cave_explorer.cave_explorer:main',
             'artifact_stub = cave_explorer.artifact_stub:main',
+            'artefact_perception = cave_explorer.artefact_perception:main'
         ],
     },
 )
