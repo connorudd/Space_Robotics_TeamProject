@@ -9,13 +9,14 @@ import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point
-from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import Pose, Pose2D, PoseArray, PoseStamped, Point
+from builtin_interfaces.msg import Duration as DurationMsg
+from nav2_msgs.action import BackUp, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -23,7 +24,17 @@ from tf2_ros.transform_listener import TransformListener
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
+import json
+
+from std_msgs.msg import Bool, Header, String
+
+try:
+    from sensor_msgs_py import point_cloud2   # part of ROS 2 Humble
+except ImportError:
+    point_cloud2 = None
+
 from cave_explorer.frontier_explorer import FrontierExplorer
+from cave_explorer.inspection_planner import InspectionPlanner
 
 
 def wrap_angle(angle):
@@ -63,6 +74,9 @@ class State(Enum):
     """Top-level behaviour. APPROACHING, INSPECTING and RETURN_HOME arrive with Planning 2 and 3."""
     EXPLORING = 1
     DONE = 2       # nothing left to explore
+    APPROACHING = 3  # driving to a standoff pose next to an artefact
+    INSPECTING = 4   # at the standoff, waiting for the detector to confirm the artefact
+    RETURNING_HOME = 5  # exploration complete or time budget used up
 
 
 class GoalOutcome(Enum):
@@ -71,6 +85,7 @@ class GoalOutcome(Enum):
     REACHED = 1    # arrived, or was cancelled within arrival_slack of the goal
     ABORTED = 2    # Nav2 gave up, or something else preempted the goal
     CANCELLED = 3  # cancelled by the stuck-goal check (or by someone else)
+    PREEMPTED = 4  # cancelled on purpose to switch behaviour: not a failure
 
 
 class CaveExplorer(Node):
@@ -114,7 +129,12 @@ class CaveExplorer(Node):
         self.marker_artifacts_.color.r = 0.0
         self.marker_artifacts_.color.g = 1.0
         self.marker_artifacts_.color.b = 0.2
-        self.marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_artifacts', 10)
+        # The template's stop-sign detector is off by default: the Perception node (artefact_perception)
+        # publishes on the same topics (marker_array_artifacts, detections_image) and replaces it.
+        self.declare_parameter('template_detector', False)
+        self.template_detector_ = self.get_parameter('template_detector').value
+        if self.template_detector_:
+            self.marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_artifacts', 10)
 
         # Remember the artifact locations
         # Array of type geometry_msgs.Point
@@ -129,6 +149,13 @@ class CaveExplorer(Node):
 
         # Action client for nav2
         self.nav2_action_client_ = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        # Nav2's own back-up behaviour, used to get unstuck (behavior_server provides 'backup')
+        self.backup_client_ = ActionClient(self, BackUp, 'backup')
+        self.declare_parameter('stuck_move_threshold', 0.5)  # m; a failed goal moving less than this = wedged
+        self.declare_parameter('backup_distance', 1.0)       # m to reverse when wedged
+        self.last_goal_moved_ = None    # straight-line distance the robot moved during the last goal
+        self.pending_outcome_ = None    # outcome held back while backing up
+        self.backup_start_ = None       # sim time the back-up was sent, None when not backing up
         self.get_logger().warn('Waiting for navigate_to_pose action...')
         self.nav2_action_client_.wait_for_server()
         self.get_logger().warn('navigate_to_pose connected')
@@ -165,10 +192,11 @@ class CaveExplorer(Node):
         self.map_sub_ = self.create_subscription(OccupancyGrid, 'map',  self.map_callback, 1)
 
         # Prepare image processing
-        self.image_detections_pub_ = self.create_publisher(Image, 'detections_image', 1)
         self.declare_parameter('computer_vision_model_filename', rclpy.Parameter.Type.STRING)
-        self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
-        self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
+        if self.template_detector_:
+            self.image_detections_pub_ = self.create_publisher(Image, 'detections_image', 1)
+            self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
+            self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
         # Frontier exploration (Planning 1). exploration:=scripted falls back to the template route.
         self.declare_parameter('exploration', 'frontier')
@@ -179,6 +207,54 @@ class CaveExplorer(Node):
         self.next_plan_time_ = None     # wait before re-planning when no frontier was usable
         self.no_frontier_count_ = 0     # plans in a row that found no usable frontier
         self.planning_marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_planning', 1)
+
+        # Close-range inspection (Planning 2). Artefacts arrive as JSON on /artifacts:
+        # a list of {id, type, x, y, z, n_obs, last_seen} in the map frame (last_seen in sim seconds).
+        self.declare_parameter('min_observations', 2)    # ignore one-off detections (likely false positives)
+        self.declare_parameter('inspect_dwell', 3.0)     # sim seconds to wait at the standoff
+        self.inspection_planner_ = InspectionPlanner()
+        self.artifacts_ = {}            # id -> latest report
+        self.inspected_ = {}            # id -> True if confirmed at close range, False if not
+        self.abandoned_ = set()         # ids given up on after repeated failures
+        self.target_ = None             # report of the artefact being approached / inspected
+        self.target_attempts_ = 0       # standoffs tried for the current target
+        self.failed_standoffs_ = []     # (x, y) standoffs that failed for the current target
+        self.inspect_start_ = None      # sim time the robot arrived at the standoff
+        self.standoff_ = None           # (x, y, yaw, path) of the current standoff goal
+        self.next_inspection_check_ = None  # sim time before which no new inspection is planned
+        self.artifacts_sub_ = self.create_subscription(String, 'artifacts', self.artifacts_callback, 10)
+
+        # The Perception node publishes confirmed artefacts (seen at least 3 times) as positions only
+        # (PoseArray, map frame, re-sent every second) plus a Bool while any artefact is in view.
+        # These are turned into the same reports as /artifacts: ids are assigned here by position.
+        self.declare_parameter('perception_match_radius', 2.0)  # m, same as the Perception merge radius
+        self.next_perception_id_ = 0
+        self.locations_sub_ = self.create_subscription(PoseArray, 'artefact_locations',
+                                                       self.artefact_locations_callback, 10)
+        self.detected_sub_ = self.create_subscription(Bool, 'artefact_detected',
+                                                      self.artefact_detected_callback, 10)
+        self.inspection_marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_inspection', 1)
+
+        # Known artefacts as obstacles for Nav2. Low artefacts (the green crystals) sit below the
+        # lidar's scan plane (lidar mounted 1 m up), so Nav2's costmaps never see them and the robot
+        # drives into them (10 Oct runs: wedged against the crystals at about (6.3, 4.4)).
+        self.declare_parameter('artifact_obstacle_radius', 0.8)   # m, disc of obstacle points per artefact
+        self.artifact_obstacle_pub_ = self.create_publisher(PointCloud2, 'artifact_obstacles', 1)
+        self.artifact_obstacle_timer_ = self.create_timer(1.0, self.publish_artifact_obstacles)
+        if point_cloud2 is None:
+            self.get_logger().error('sensor_msgs_py not found: artefacts will not be sent to Nav2 as obstacles')
+
+        # Behaviour switching (Planning 3)
+        self.declare_parameter('mission_time', 0.0)   # sim seconds before returning home; 0 = no limit
+        self.declare_parameter('home_x', 0.0)         # the robot spawns at the map origin
+        self.declare_parameter('home_y', 0.0)
+        self.preempt_reason_ = None      # set when a goal is cancelled on purpose (not a failure)
+        self.mission_start_ = None       # sim time of the first tick with a map -> base_link transform
+        self.home_attempts_ = 0
+        self.next_preempt_check_ = 0.0   # sim time of the next check for a reason to preempt
+        self.state_pub_ = self.create_publisher(String, 'planner_state', 1)
+        self.state_marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_state', 1)
+        self.state_marker_timer_ = self.create_timer(1.0, self.publish_state_display)
 
         self.set_state(State.EXPLORING, 'startup')
 
@@ -191,6 +267,9 @@ class CaveExplorer(Node):
         old = self.state_.name if self.state_ is not None else 'none'
         self.get_logger().info(f'State {old} -> {new_state.name} ({reason})')
         self.state_ = new_state
+        msg = String()
+        msg.data = f'{new_state.name}: {reason}'
+        self.state_pub_.publish(msg)
     
     def get_pose_2d(self):
         """Get the 2d pose of the robot"""
@@ -383,7 +462,9 @@ class CaveExplorer(Node):
         self.last_progress_time_ = self.get_clock().now()
         self.cancel_reason_ = None
         self.cancel_near_goal_ = False
+        self.preempt_reason_ = None
         self.first_distance_ = None
+        self.last_goal_moved_ = None
         self.goal_start_pose_ = self.get_pose_2d()
         self.goal_handle_ = goal_handle
         self.get_result_future_ = goal_handle.get_result_async()
@@ -479,6 +560,9 @@ class CaveExplorer(Node):
         elif status == GoalStatus.STATUS_ABORTED:
             self.get_logger().warn('Goal aborted by Nav2')
             self.goal_outcome_ = GoalOutcome.ABORTED
+        elif status == GoalStatus.STATUS_CANCELED and self.preempt_reason_ is not None:
+            self.get_logger().info(f'Goal preempted: {self.preempt_reason_}')
+            self.goal_outcome_ = GoalOutcome.PREEMPTED
         elif status == GoalStatus.STATUS_CANCELED and self.cancel_near_goal_:
             self.get_logger().info('Goal cancelled near the goal: counted as reached')
             self.goal_outcome_ = GoalOutcome.REACHED
@@ -497,8 +581,11 @@ class CaveExplorer(Node):
             first = f'{self.first_distance_:.1f}' if self.first_distance_ is not None else '?'
             end_pose = self.get_pose_2d()
             if self.goal_start_pose_ is not None and end_pose is not None:
-                moved = f'{math.hypot(end_pose.x - self.goal_start_pose_.x, end_pose.y - self.goal_start_pose_.y):.1f}'
+                self.last_goal_moved_ = math.hypot(end_pose.x - self.goal_start_pose_.x,
+                                                   end_pose.y - self.goal_start_pose_.y)
+                moved = f'{self.last_goal_moved_:.1f}'
             else:
+                self.last_goal_moved_ = None
                 moved = '?'
             self.get_logger().info(f'Goal ended with {feedback.distance_remaining:.2f} m remaining '
                                    f'(started at {first} m, robot moved {moved} m), '
@@ -506,6 +593,7 @@ class CaveExplorer(Node):
         self.last_feedback_ = None
         self.cancel_reason_ = None
         self.cancel_near_goal_ = False
+        self.preempt_reason_ = None
         self.ready_for_next_goal_ = True
 
     def retry_goal_callback(self):
@@ -615,6 +703,8 @@ class CaveExplorer(Node):
             self.get_logger().warn('Waiting for the map -> base_link transform (is SLAM running?)',
                                    throttle_duration_sec=2.0)
             return
+        if self.mission_start_ is None:
+            self.mission_start_ = self.now_sec()
 
         #######################################################
         # Update flags related to the progress of the current planner
@@ -635,6 +725,16 @@ class CaveExplorer(Node):
             if stuck_reason is not None:
                 self.cancel_active_goal(stuck_reason)
 
+        # A back-up that never answers must not freeze the node
+        if self.backup_start_ is not None and self.now_sec() - self.backup_start_ > 20.0:
+            self.get_logger().error('Back-up did not finish in 20 s, carrying on')
+            self.backup_done(None)
+
+        # Behaviour switching that has to interrupt a goal in flight (Planning 3)
+        if self.check_time_budget():
+            return
+        self.check_preemption()
+
         # Check if previous goal still running
         if not self.ready_for_next_goal_:
             return
@@ -645,13 +745,26 @@ class CaveExplorer(Node):
         outcome = self.goal_outcome_
         self.goal_outcome_ = GoalOutcome.NONE
 
+        # Wedged: the goal failed and the robot barely moved. Reverse first, then let the
+        # state handle the failure as usual (backup_done hands the outcome back).
+        if outcome in (GoalOutcome.ABORTED, GoalOutcome.CANCELLED) and self.last_goal_moved_ is not None \
+                and self.last_goal_moved_ < self.get_parameter('stuck_move_threshold').value:
+            if self.start_backup(outcome):
+                return
+
         if self.state_ == State.EXPLORING:
             if self.get_parameter('exploration').value == 'scripted':
                 self.state_exploring_scripted(outcome)
             else:
                 self.state_exploring_frontier(outcome)
+        elif self.state_ == State.APPROACHING:
+            self.state_approaching(outcome)
+        elif self.state_ == State.INSPECTING:
+            self.state_inspecting()
+        elif self.state_ == State.RETURNING_HOME:
+            self.state_returning_home(outcome)
         elif self.state_ == State.DONE:
-            self.get_logger().info('Exploration finished, idle', throttle_duration_sec=30.0)
+            self.get_logger().info('Mission finished, idle', throttle_duration_sec=30.0)
         else:
             # Log instead of crashing: the old destroy_node() here left a dead node spinning
             self.get_logger().error(f'No handler for state {self.state_}', throttle_duration_sec=5.0)
@@ -675,7 +788,11 @@ class CaveExplorer(Node):
             self.get_logger().warn(f'Frontier goal [{goal.x:.2f}, {goal.y:.2f}] failed ({outcome.name}), '
                                    f'blacklisted ({len(self.blacklist_)} total)')
 
-        # 2. Wait for a map, a pose, and any re-plan delay
+        # 2. An artefact waiting for inspection takes priority over the next frontier
+        if self.start_inspection_if_needed():
+            return
+
+        # 3. Wait for a map, a pose, and any re-plan delay
         if self.map_msg_ is None:
             self.get_logger().warn('Waiting for the first map', throttle_duration_sec=5.0)
             return
@@ -686,29 +803,442 @@ class CaveExplorer(Node):
         if pose is None:
             return
 
-        # 3. Plan on the latest map
+        # 4. Plan on the latest map
         info = self.map_msg_.info
         grid = np.array(self.map_msg_.data, dtype=np.int8).reshape(info.height, info.width)
         best, frontiers, reason = self.frontier_explorer_.plan(
             grid, info.resolution, info.origin.position.x, info.origin.position.y,
-            (pose.x, pose.y), blacklist=self.blacklist_ + self.visited_goals_)
+            (pose.x, pose.y),
+            # Known artefacts too: low artefacts may be invisible to the lidar (mounted 1 m up), and the
+            # pocket behind one is never mapped, so a frontier next to an artefact lures the robot into it
+            blacklist=self.blacklist_ + self.visited_goals_ +
+            [(a['x'], a['y']) for a in self.artifacts_.values()])
         self.publish_frontier_markers(frontiers, best, info)
 
         if best is None:
             self.no_frontier_count_ += 1
             self.get_logger().warn(f'No frontier goal: {reason} ({self.no_frontier_count_}/3)')
             if self.no_frontier_count_ >= 3:
-                self.set_state(State.DONE, reason)
+                self.start_return_home(reason)
             else:
                 self.next_plan_time_ = now + Duration(seconds=2.0)  # let the map update first
             return
 
-        # 4. Go there
+        # 5. Go there
         self.no_frontier_count_ = 0
         gx, gy, yaw = best.goal
         self.get_logger().info(f'Frontier goal [{gx:.2f}, {gy:.2f}]: {reason}, '
                                f'cluster of {best.size} cells')
         self.planner_go_to_pose2d(Pose2D(x=float(gx), y=float(gy), theta=float(yaw)))
+
+    ###########################################################
+    # Behaviour switching (Planning 3)
+
+    def preempt_active_goal(self, reason):
+        """Cancel the active goal on purpose. It ends as PREEMPTED: not blacklisted, no back-up."""
+        self.get_logger().warn(f'Preempting the current goal: {reason}')
+        self.preempt_reason_ = reason
+        self.cancel_reason_ = reason   # stops the stuck-goal check cancelling it a second time
+        self.goal_handle_.cancel_goal_async()
+
+    def check_time_budget(self):
+        """When mission_time is used up, stop what we are doing and go home. True while it takes over."""
+        limit = self.get_parameter('mission_time').value
+        if limit <= 0.0 or self.state_ in (State.RETURNING_HOME, State.DONE):
+            return False
+        if self.now_sec() - self.mission_start_ < limit:
+            return False
+        if self.goal_handle_ is not None:
+            if self.preempt_reason_ is None:
+                self.preempt_active_goal(f'time budget of {limit:.0f} s used up')
+            return True     # wait for the cancel to finish
+        if not self.ready_for_next_goal_:
+            return True     # a goal request or back-up is still in progress
+        self.start_return_home(f'time budget of {limit:.0f} s used up')
+        return True
+
+    def check_preemption(self):
+        """Interrupt a goal in flight when something more important comes up (checked every 2 s)"""
+        if self.goal_handle_ is None or self.preempt_reason_ is not None or self.cancel_reason_ is not None:
+            return
+        if self.now_sec() < self.next_preempt_check_:
+            return
+        self.next_preempt_check_ = self.now_sec() + 2.0
+
+        # Exploring and an artefact is waiting: go and inspect it now, not after this frontier
+        if self.state_ == State.EXPLORING and self.get_parameter('exploration').value != 'scripted':
+            found = self.next_inspection_target()
+            if found is not None:
+                artifact = found[0]
+                self.preempt_active_goal(f"artefact {artifact['id']} ({artifact['type']}) waiting for inspection")
+            return
+
+        # Approaching and the detector has moved the target: re-plan the standoff
+        if self.state_ == State.APPROACHING and self.target_ is not None:
+            latest = self.artifacts_.get(self.target_['id'])
+            if latest is not None and math.hypot(latest['x'] - self.target_['x'],
+                                                 latest['y'] - self.target_['y']) > 1.5:
+                self.target_ = latest
+                self.preempt_active_goal(f"artefact {latest['id']} moved to "
+                                         f"({latest['x']:.1f}, {latest['y']:.1f})")
+
+    def start_return_home(self, reason):
+        """Drop whatever is happening and drive back to the start"""
+        self.goal_outcome_ = GoalOutcome.NONE
+        self.target_ = None
+        self.standoff_ = None
+        self.home_attempts_ = 0
+        self.set_state(State.RETURNING_HOME, reason)
+        self.send_home_goal()
+
+    def send_home_goal(self):
+        self.planner_go_to_pose2d(Pose2D(x=float(self.get_parameter('home_x').value),
+                                         y=float(self.get_parameter('home_y').value), theta=0.0))
+
+    def state_returning_home(self, outcome):
+        """RETURNING_HOME: up to three tries, then stop wherever the robot is"""
+        if outcome == GoalOutcome.REACHED:
+            self.set_state(State.DONE, 'back home')
+        elif outcome in (GoalOutcome.ABORTED, GoalOutcome.CANCELLED, GoalOutcome.PREEMPTED):
+            self.home_attempts_ += 1
+            if self.home_attempts_ < 3:
+                self.get_logger().warn(f'Return home failed ({outcome.name}), trying again')
+                self.send_home_goal()
+            else:
+                self.set_state(State.DONE, 'could not reach home after 3 attempts')
+
+    def publish_state_display(self):
+        """RViz: the current state as text above the robot, for the demo"""
+        if self.state_ is None or not self.tf_buffer.can_transform('map', 'base_link', rclpy.time.Time()):
+            return
+        pose = self.get_pose_2d()
+        if pose is None:
+            return
+        text = self.state_.name
+        if self.state_ in (State.APPROACHING, State.INSPECTING) and self.target_ is not None:
+            text += f" artefact {self.target_['id']} ({self.target_['type']})"
+        confirmed = sum(1 for v in self.inspected_.values() if v)
+        text += f'\ninspected {confirmed}/{len(self.artifacts_)}'
+        limit = self.get_parameter('mission_time').value
+        if limit > 0.0 and self.mission_start_ is not None:
+            text += f'  time {self.now_sec() - self.mission_start_:.0f}/{limit:.0f} s'
+
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'planner_state'
+        m.id = 0
+        m.type = Marker.TEXT_VIEW_FACING
+        m.action = Marker.ADD
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = pose.x, pose.y, 2.5
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.6
+        m.color.r = m.color.g = m.color.b = m.color.a = 1.0
+        m.text = text
+        markers = MarkerArray()
+        markers.markers.append(m)
+        self.state_marker_pub_.publish(markers)
+
+    ###########################################################
+    # Artefacts as obstacles for Nav2
+
+    def publish_artifact_obstacles(self):
+        """Publish a disc of points (map frame, 0.3 m up) around every trusted artefact.
+        Nav2 marks them in a costmap layer of their own, which the lidar cannot clear."""
+        if point_cloud2 is None:
+            return
+        radius = self.get_parameter('artifact_obstacle_radius').value
+        min_obs = self.get_parameter('min_observations').value
+        step = 0.15
+        n = int(radius / step)
+        offsets = [(i * step, j * step) for i in range(-n, n + 1) for j in range(-n, n + 1)
+                   if (i * step) ** 2 + (j * step) ** 2 <= radius ** 2]
+        points = [(float(a['x'] + dx), float(a['y'] + dy), 0.3)
+                  for a in self.artifacts_.values() if a.get('n_obs', min_obs) >= min_obs
+                  for dx, dy in offsets]
+        header = Header()
+        header.frame_id = 'map'
+        header.stamp = self.get_clock().now().to_msg()
+        self.artifact_obstacle_pub_.publish(point_cloud2.create_cloud_xyz32(header, points))
+
+    ###########################################################
+    # Getting unstuck
+
+    def start_backup(self, outcome):
+        """Reverse a short distance with Nav2's back-up behaviour. True if it was sent."""
+        if not self.backup_client_.server_is_ready():
+            self.get_logger().warn('Robot is wedged but the backup action is not available')
+            return False
+        distance = self.get_parameter('backup_distance').value
+        self.get_logger().warn(f'Goal failed and the robot moved only {self.last_goal_moved_:.1f} m: '
+                               f'backing up {distance:.1f} m')
+        goal = BackUp.Goal()
+        goal.target.x = float(distance)   # distance to travel; the behaviour drives it in reverse
+        goal.speed = 0.15
+        goal.time_allowance = DurationMsg(sec=10)
+        self.pending_outcome_ = outcome
+        self.last_goal_moved_ = None
+        self.ready_for_next_goal_ = False
+        self.backup_start_ = self.now_sec()
+        future = self.backup_client_.send_goal_async(goal)
+        future.add_done_callback(self.backup_response_callback)
+        return True
+
+    def backup_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Back-up rejected')
+            self.backup_done(None)
+            return
+        goal_handle.get_result_async().add_done_callback(
+            lambda result_future: self.backup_done(result_future.result().status))
+
+    def backup_done(self, status):
+        """Back-up finished (or gave up): hand the held-back outcome to the state handler"""
+        if self.backup_start_ is None:
+            return   # already handled (late callback after the 20 s guard)
+        ok = status == GoalStatus.STATUS_SUCCEEDED
+        self.get_logger().info(f'Back-up {"finished" if ok else "did not complete"} (status {status})')
+        self.backup_start_ = None
+        self.goal_outcome_ = self.pending_outcome_
+        self.pending_outcome_ = None
+        self.ready_for_next_goal_ = True
+
+    ###########################################################
+    # Close-range inspection (Planning 2)
+
+    def now_sec(self):
+        """Node clock (sim time) in seconds, the same clock the detector uses for last_seen"""
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def artifacts_callback(self, msg):
+        """Keep the latest report of every artefact, keyed by the detector's id"""
+        try:
+            reports = json.loads(msg.data)
+        except ValueError:
+            self.get_logger().warn('Could not parse /artifacts JSON', throttle_duration_sec=5.0)
+            return
+        for report in reports:
+            if not isinstance(report, dict) or not all(k in report for k in ('id', 'type', 'x', 'y')):
+                self.get_logger().warn(f'Ignoring malformed artefact report: {report}', throttle_duration_sec=5.0)
+                continue
+            if report['id'] not in self.artifacts_:
+                self.get_logger().info(f"New artefact {report['id']} ({report['type']}) "
+                                       f"at ({report['x']:.1f}, {report['y']:.1f})")
+            self.artifacts_[report['id']] = report
+
+    def artefact_locations_callback(self, msg):
+        """Confirmed positions from the Perception node -> reports keyed by a stable id of our own.
+        A position within perception_match_radius of a known artefact updates it; otherwise it is new."""
+        radius = self.get_parameter('perception_match_radius').value
+        for pose in msg.poses:
+            x, y = pose.position.x, pose.position.y
+            best_id, best_d = None, radius
+            for artifact_id, a in self.artifacts_.items():
+                d = math.hypot(a['x'] - x, a['y'] - y)
+                if d < best_d:
+                    best_id, best_d = artifact_id, d
+            if best_id is None:
+                artifact_id = f'p{self.next_perception_id_}'
+                self.next_perception_id_ += 1
+                # Perception only publishes artefacts it has seen at least 3 times, so it is trusted
+                self.artifacts_[artifact_id] = {'id': artifact_id, 'type': 'artefact', 'x': x, 'y': y,
+                                                'z': 0.5, 'n_obs': 3, 'last_seen': self.now_sec()}
+                self.get_logger().info(f'New artefact {artifact_id} from Perception at ({x:.1f}, {y:.1f})')
+            else:
+                # A new dict, not an in-place edit, so the 'target moved' check can compare old and new
+                self.artifacts_[best_id] = {**self.artifacts_[best_id], 'x': x, 'y': y}
+
+    def artefact_detected_callback(self, msg):
+        """Perception sees an artefact right now: mark the known artefacts in the camera's view as seen.
+        This is what confirms an inspection (seen again while the robot waits at the standoff)."""
+        if not msg.data:
+            return
+        pose = self.get_pose_2d()
+        if pose is None:
+            return
+        now = self.now_sec()
+        for artifact_id, a in self.artifacts_.items():
+            dx, dy = a['x'] - pose.x, a['y'] - pose.y
+            bearing = math.atan2(dy, dx) - pose.theta
+            bearing = math.atan2(math.sin(bearing), math.cos(bearing))
+            if math.hypot(dx, dy) <= 8.0 and abs(bearing) <= math.radians(60):   # 120 deg camera
+                self.artifacts_[artifact_id] = {**a, 'last_seen': now}
+
+    def pending_artifacts(self):
+        """Artefacts seen often enough to trust, not yet inspected or given up on"""
+        min_obs = self.get_parameter('min_observations').value
+        return [a for a in self.artifacts_.values()
+                if a['id'] not in self.inspected_ and a['id'] not in self.abandoned_
+                and a.get('n_obs', min_obs) >= min_obs]
+
+    def find_standoff(self, artifact, pose):
+        """Best standoff pose for the artefact, or None if none is reachable on the current map"""
+        info = self.map_msg_.info
+        grid = np.array(self.map_msg_.data, dtype=np.int8).reshape(info.height, info.width)
+        standoffs = self.inspection_planner_.standoffs(
+            grid, info.resolution, info.origin.position.x, info.origin.position.y,
+            (pose.x, pose.y), (artifact['x'], artifact['y']), failed=self.failed_standoffs_)
+        return standoffs[0] if standoffs else None
+
+    def next_inspection_target(self):
+        """(artefact, standoff) for the nearest waiting artefact that has a reachable standoff, or None"""
+        if self.map_msg_ is None:
+            return None
+        if self.next_inspection_check_ is not None and self.now_sec() < self.next_inspection_check_:
+            return None
+        pending = self.pending_artifacts()
+        if not pending:
+            return None
+        pose = self.get_pose_2d()
+        if pose is None:
+            return None
+
+        pending.sort(key=lambda a: math.hypot(a['x'] - pose.x, a['y'] - pose.y))
+        for artifact in pending:
+            self.failed_standoffs_ = []
+            standoff = self.find_standoff(artifact, pose)
+            if standoff is not None:
+                return artifact, standoff
+
+        # None reachable yet: keep exploring, the map may open a way later. Check again in 5 s.
+        self.get_logger().info(f'{len(pending)} artefact(s) waiting, no standoff reachable yet')
+        self.next_inspection_check_ = self.now_sec() + 5.0
+        return None
+
+    def start_inspection_if_needed(self):
+        """If an artefact is waiting, drive to a standoff next to the nearest one. True if a goal was sent."""
+        found = self.next_inspection_target()
+        if found is None:
+            return False
+        artifact, standoff = found
+        self.target_ = artifact
+        self.target_attempts_ = 0
+        self.failed_standoffs_ = []
+        self.set_state(State.APPROACHING, f"artefact {artifact['id']} ({artifact['type']}) "
+                                          f"at ({artifact['x']:.1f}, {artifact['y']:.1f})")
+        self.send_standoff_goal(standoff)
+        return True
+
+    def send_standoff_goal(self, standoff):
+        self.standoff_ = standoff
+        x, y, yaw, path = standoff
+        self.get_logger().info(f"Standoff [{x:.2f}, {y:.2f}] for artefact {self.target_['id']}, "
+                               f"path {path:.1f} m, attempt {self.target_attempts_ + 1}")
+        self.planner_go_to_pose2d(Pose2D(x=float(x), y=float(y), theta=float(yaw)))
+        self.publish_inspection_markers()
+
+    def state_approaching(self, outcome):
+        """APPROACHING: the standoff goal has ended"""
+        if outcome == GoalOutcome.PREEMPTED:
+            # The detector moved the target: plan a standoff for the new position (not a failed attempt)
+            pose = self.get_pose_2d()
+            standoff = self.find_standoff(self.target_, pose) if pose is not None else None
+            if standoff is not None:
+                self.send_standoff_goal(standoff)
+            else:
+                self.finish_inspection(None, f"artefact {self.target_['id']}: no standoff after it moved")
+        elif outcome == GoalOutcome.REACHED:
+            self.inspect_start_ = self.now_sec()
+            self.set_state(State.INSPECTING, f"at the standoff for artefact {self.target_['id']}")
+        elif outcome in (GoalOutcome.ABORTED, GoalOutcome.CANCELLED):
+            self.retry_or_give_up(f'approach failed ({outcome.name})', final_result=None)
+
+    def state_inspecting(self):
+        """INSPECTING: wait at the standoff, then check the detector saw the artefact while we were here"""
+        if self.now_sec() - self.inspect_start_ < self.get_parameter('inspect_dwell').value:
+            return
+        latest = self.artifacts_.get(self.target_['id'], self.target_)
+        if latest.get('last_seen', -1.0) >= self.inspect_start_:
+            self.finish_inspection(True, f"artefact {self.target_['id']} confirmed at close range")
+        else:
+            self.retry_or_give_up('not seen from the standoff', final_result=False)
+
+    def retry_or_give_up(self, reason, final_result):
+        """One more standoff for the same artefact, then give up.
+        final_result: None = could not get there (abandoned), False = got there but not confirmed."""
+        self.failed_standoffs_.append(self.standoff_[:2])
+        self.target_attempts_ += 1
+        pose = self.get_pose_2d()
+        if self.target_attempts_ < 2 and pose is not None:
+            standoff = self.find_standoff(self.target_, pose)
+            if standoff is not None:
+                self.get_logger().warn(f"Artefact {self.target_['id']}: {reason}, trying another standoff")
+                if self.state_ != State.APPROACHING:
+                    self.set_state(State.APPROACHING, f"retry for artefact {self.target_['id']}")
+                self.send_standoff_goal(standoff)
+                return
+        self.finish_inspection(final_result, f"artefact {self.target_['id']}: {reason}, giving up")
+
+    def finish_inspection(self, result, reason):
+        """Record the result for the target and go back to exploring"""
+        artifact_id = self.target_['id']
+        if result is None:
+            self.abandoned_.add(artifact_id)
+        else:
+            self.inspected_[artifact_id] = result
+        confirmed = sum(1 for v in self.inspected_.values() if v)
+        self.get_logger().info(f'Inspection finished: {reason}. Confirmed {confirmed}, '
+                               f'unconfirmed {len(self.inspected_) - confirmed}, '
+                               f'abandoned {len(self.abandoned_)}, known {len(self.artifacts_)}')
+        self.target_ = None
+        self.standoff_ = None
+        self.publish_inspection_markers()
+        self.set_state(State.EXPLORING, reason)
+
+    def publish_inspection_markers(self):
+        """RViz: current target and standoff, plus every artefact coloured by inspection result"""
+
+        stamp = self.get_clock().now().to_msg()
+        markers = MarkerArray()
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        markers.markers.append(clear)
+
+        groups = {'confirmed': ([], (0.0, 1.0, 0.0)), 'unconfirmed': ([], (1.0, 0.6, 0.0)),
+                  'abandoned': ([], (1.0, 0.0, 0.0)), 'pending': ([], (0.6, 0.6, 1.0))}
+        for a in self.artifacts_.values():
+            if a['id'] in self.abandoned_:
+                key = 'abandoned'
+            elif a['id'] in self.inspected_:
+                key = 'confirmed' if self.inspected_[a['id']] else 'unconfirmed'
+            else:
+                key = 'pending'
+            groups[key][0].append(Point(x=float(a['x']), y=float(a['y']), z=1.5))
+
+        for i, (ns, (points, rgb)) in enumerate(groups.items()):
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp = stamp
+            m.ns = ns
+            m.id = i
+            m.type = Marker.SPHERE_LIST
+            m.action = Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.7
+            m.color.r, m.color.g, m.color.b = rgb
+            m.color.a = 1.0
+            m.points = points
+            markers.markers.append(m)
+
+        if self.standoff_ is not None:
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp = stamp
+            m.ns = 'standoff'
+            m.id = 0
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            m.pose = pose2d_to_pose(Pose2D(x=float(self.standoff_[0]), y=float(self.standoff_[1]),
+                                           theta=float(self.standoff_[2])))
+            m.pose.position.z = 0.3
+            m.scale.x, m.scale.y, m.scale.z = 1.0, 0.25, 0.25
+            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.0, 1.0, 1.0
+            markers.markers.append(m)
+
+        self.inspection_marker_pub_.publish(markers)
+
+    ###########################################################
 
     def publish_frontier_markers(self, frontiers, best, info):
         """RViz: frontier cells by status, the chosen goal, and blacklisted / visited goals"""
