@@ -197,7 +197,7 @@ local_costmap:
       resolution: 0.3 # 0.05
       robot_radius: 0.5 #added by GB 
       # footprint: "[ [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5] ]"
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "artifact_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -215,6 +215,23 @@ local_costmap:
           raytrace_max_range: 200.0 # 20.0
           raytrace_min_range: 0.0
           obstacle_max_range: 100.0 # 10.0
+          obstacle_min_range: 0.0
+      artifact_layer:
+        # Low artefacts (e.g. the crystals) sit under the 1 m lidar, so the scan never marks them.
+        # cave_explorer publishes each trusted artefact as a disc of points on /artifact_obstacles.
+        # Kept in its own layer with clearing off, so the lidar cannot erase them.
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: True
+        observation_sources: artifacts
+        artifacts:
+          topic: /artifact_obstacles
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+          obstacle_max_range: 200.0   # measured from the cloud's frame origin (map origin), so must cover the whole cave
           obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -237,7 +254,7 @@ global_costmap:
       rolling_window: true
       resolution: 0.3 # 0.1
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "artifact_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -251,6 +268,23 @@ global_costmap:
           raytrace_max_range: 200.0 #20.0
           raytrace_min_range: 0.0
           obstacle_max_range: 100.0 #10.0
+          obstacle_min_range: 0.0
+      artifact_layer:
+        # Low artefacts (e.g. the crystals) sit under the 1 m lidar, so the scan never marks them.
+        # cave_explorer publishes each trusted artefact as a disc of points on /artifact_obstacles.
+        # Kept in its own layer with clearing off, so the lidar cannot erase them.
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: True
+        observation_sources: artifacts
+        artifacts:
+          topic: /artifact_obstacles
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+          obstacle_max_range: 200.0   # measured from the cloud's frame origin (map origin), so must cover the whole cave
           obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"

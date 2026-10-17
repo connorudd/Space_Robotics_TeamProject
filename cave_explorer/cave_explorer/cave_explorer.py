@@ -206,6 +206,10 @@ class CaveExplorer(Node):
         self.visited_goals_ = []        # frontier goals already reached: never sent again
         self.next_plan_time_ = None     # wait before re-planning when no frontier was usable
         self.no_frontier_count_ = 0     # plans in a row that found no usable frontier
+        # A goal is blacklisted after one failure, which can be bad luck (wedged once, a recovery at the
+        # wrong moment). Before calling the cave explored, clear the blacklist and try those goals again.
+        self.declare_parameter('blacklist_retries', 1)
+        self.blacklist_rounds_ = 0      # times the blacklist has been cleared
         self.planning_marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_planning', 1)
 
         # Close-range inspection (Planning 2). Artefacts arrive as JSON on /artifacts:
@@ -238,7 +242,16 @@ class CaveExplorer(Node):
         # Known artefacts as obstacles for Nav2. Low artefacts (the green crystals) sit below the
         # lidar's scan plane (lidar mounted 1 m up), so Nav2's costmaps never see them and the robot
         # drives into them (10 Oct runs: wedged against the crystals at about (6.3, 4.4)).
-        self.declare_parameter('artifact_obstacle_radius', 0.8)   # m, disc of obstacle points per artefact
+        # 17 Oct, with a 0.8 m disc: still wedged at (7.3, 2.8). Both wedge points are 2.2-2.4 m from the
+        # crystals' reported position, so the cluster reaches about 1.7-1.9 m out. On the saved maps a
+        # 2.0 m disc still leaves the passage past the crystals open, so 1.8 m costs no reachability.
+        # The same discs are drawn into the map the frontier and standoff planners use, so they agree with Nav2.
+        self.declare_parameter('artifact_obstacle_radius', 1.8)   # m, disc of obstacle points per artefact
+        # Points this close to the robot are left out. An artefact first trusted with the robot already
+        # beside it (17 Oct run 2: ice formation, robot 1.6 m away) would otherwise put the robot inside
+        # an obstacle, and Nav2 can then neither plan nor turn. Nav2 clears its costmaps during recovery,
+        # so a robot trapped this way is released at the next clear.
+        self.declare_parameter('artifact_robot_clearance', 0.9)   # m
         self.artifact_obstacle_pub_ = self.create_publisher(PointCloud2, 'artifact_obstacles', 1)
         self.artifact_obstacle_timer_ = self.create_timer(1.0, self.publish_artifact_obstacles)
         if point_cloud2 is None:
@@ -251,6 +264,7 @@ class CaveExplorer(Node):
         self.preempt_reason_ = None      # set when a goal is cancelled on purpose (not a failure)
         self.mission_start_ = None       # sim time of the first tick with a map -> base_link transform
         self.home_attempts_ = 0
+        self.home_can_inspect_ = False   # True when going home because the cave is explored (not the time budget)
         self.next_preempt_check_ = 0.0   # sim time of the next check for a reason to preempt
         self.state_pub_ = self.create_publisher(String, 'planner_state', 1)
         self.state_marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_state', 1)
@@ -531,9 +545,17 @@ class CaveExplorer(Node):
         feedback = self.last_feedback_
         remaining = f'{feedback.distance_remaining:.2f} m' if feedback is not None else 'unknown distance'
 
-        # Close enough already: count it as reached, and do not blacklist a goal we got to
-        self.cancel_near_goal_ = feedback is not None and \
-            feedback.distance_remaining <= self.get_parameter('arrival_slack').value
+        # Close enough already: count it as reached, and do not blacklist a goal we got to.
+        # Judged on the robot's actual distance to the goal, not Nav2's feedback: when Nav2 cannot
+        # plan at all it reports 0.00 m remaining (17 Oct run 2: four goals 20-40 m away, including
+        # the trip home, were wrongly counted as reached that way).
+        pose = self.get_pose_2d()
+        if pose is not None:
+            straight_line = math.hypot(goal.x - pose.x, goal.y - pose.y)
+            remaining = f'{straight_line:.2f} m'
+            self.cancel_near_goal_ = straight_line <= self.get_parameter('arrival_slack').value
+        else:
+            self.cancel_near_goal_ = False
         if self.cancel_near_goal_:
             self.get_logger().warn(f'Cancelling goal [{goal.x:.2f}, {goal.y:.2f}]: {reason}, '
                                    f'{remaining} remaining (close enough, counting it as reached)')
@@ -805,7 +827,7 @@ class CaveExplorer(Node):
 
         # 4. Plan on the latest map
         info = self.map_msg_.info
-        grid = np.array(self.map_msg_.data, dtype=np.int8).reshape(info.height, info.width)
+        grid = self.planning_grid()
         best, frontiers, reason = self.frontier_explorer_.plan(
             grid, info.resolution, info.origin.position.x, info.origin.position.y,
             (pose.x, pose.y),
@@ -818,8 +840,16 @@ class CaveExplorer(Node):
         if best is None:
             self.no_frontier_count_ += 1
             self.get_logger().warn(f'No frontier goal: {reason} ({self.no_frontier_count_}/3)')
-            if self.no_frontier_count_ >= 3:
-                self.start_return_home(reason)
+            if self.no_frontier_count_ >= 3 and self.blacklist_ \
+                    and self.blacklist_rounds_ < self.get_parameter('blacklist_retries').value:
+                self.blacklist_rounds_ += 1
+                self.get_logger().warn(f'No frontier left, but {len(self.blacklist_)} goal(s) were given up on: '
+                                       f'clearing the blacklist to try them again (round {self.blacklist_rounds_})')
+                self.blacklist_ = []
+                self.no_frontier_count_ = 0
+                self.next_plan_time_ = now + Duration(seconds=2.0)
+            elif self.no_frontier_count_ >= 3:
+                self.start_return_home(reason, can_inspect=True)
             else:
                 self.next_plan_time_ = now + Duration(seconds=2.0)  # let the map update first
             return
@@ -873,6 +903,14 @@ class CaveExplorer(Node):
                 self.preempt_active_goal(f"artefact {artifact['id']} ({artifact['type']}) waiting for inspection")
             return
 
+        # Going home because the cave is explored, and an artefact turns up on the way: inspect it first
+        if self.state_ == State.RETURNING_HOME and self.home_can_inspect_:
+            found = self.next_inspection_target()
+            if found is not None:
+                artifact = found[0]
+                self.preempt_active_goal(f"artefact {artifact['id']} ({artifact['type']}) waiting for inspection")
+            return
+
         # Approaching and the detector has moved the target: re-plan the standoff
         if self.state_ == State.APPROACHING and self.target_ is not None:
             latest = self.artifacts_.get(self.target_['id'])
@@ -882,12 +920,15 @@ class CaveExplorer(Node):
                 self.preempt_active_goal(f"artefact {latest['id']} moved to "
                                          f"({latest['x']:.1f}, {latest['y']:.1f})")
 
-    def start_return_home(self, reason):
-        """Drop whatever is happening and drive back to the start"""
+    def start_return_home(self, reason, can_inspect=False):
+        """Drop whatever is happening and drive back to the start.
+        can_inspect: an artefact found on the way home may still interrupt the trip (cave explored);
+        not when the time budget sent the robot home."""
         self.goal_outcome_ = GoalOutcome.NONE
         self.target_ = None
         self.standoff_ = None
         self.home_attempts_ = 0
+        self.home_can_inspect_ = can_inspect
         self.set_state(State.RETURNING_HOME, reason)
         self.send_home_goal()
 
@@ -899,6 +940,10 @@ class CaveExplorer(Node):
         """RETURNING_HOME: up to three tries, then stop wherever the robot is"""
         if outcome == GoalOutcome.REACHED:
             self.set_state(State.DONE, 'back home')
+        elif outcome == GoalOutcome.PREEMPTED and self.home_can_inspect_ and self.start_inspection_if_needed():
+            return      # an artefact found on the way home; exploring resumes after it, then home again
+        elif outcome == GoalOutcome.PREEMPTED:
+            self.send_home_goal()   # interrupted on purpose, not a failed attempt
         elif outcome in (GoalOutcome.ABORTED, GoalOutcome.CANCELLED, GoalOutcome.PREEMPTED):
             self.home_attempts_ += 1
             if self.home_attempts_ < 3:
@@ -956,6 +1001,10 @@ class CaveExplorer(Node):
         points = [(float(a['x'] + dx), float(a['y'] + dy), 0.3)
                   for a in self.artifacts_.values() if a.get('n_obs', min_obs) >= min_obs
                   for dx, dy in offsets]
+        pose = self.get_pose_2d()
+        if pose is not None:
+            keep_clear = self.get_parameter('artifact_robot_clearance').value
+            points = [p for p in points if math.hypot(p[0] - pose.x, p[1] - pose.y) > keep_clear]
         header = Header()
         header.frame_id = 'map'
         header.stamp = self.get_clock().now().to_msg()
@@ -1072,13 +1121,46 @@ class CaveExplorer(Node):
                 if a['id'] not in self.inspected_ and a['id'] not in self.abandoned_
                 and a.get('n_obs', min_obs) >= min_obs]
 
-    def find_standoff(self, artifact, pose):
-        """Best standoff pose for the artefact, or None if none is reachable on the current map"""
+    def trusted_artifacts(self):
+        """Artefacts seen often enough to act on (inspected or not)"""
+        min_obs = self.get_parameter('min_observations').value
+        return [a for a in self.artifacts_.values() if a.get('n_obs', min_obs) >= min_obs]
+
+    def planning_grid(self, exclude_id=None):
+        """The SLAM map with every trusted artefact drawn in as an occupied disc, as Nav2 sees it
+        through the artefact layer. Without this the planners would send the robot past low artefacts
+        that Nav2 will not drive through."""
         info = self.map_msg_.info
         grid = np.array(self.map_msg_.data, dtype=np.int8).reshape(info.height, info.width)
+        radius = self.get_parameter('artifact_obstacle_radius').value
+        res, ox, oy = info.resolution, info.origin.position.x, info.origin.position.y
+        n = int(math.ceil(radius / res))
+        for a in self.trusted_artifacts():
+            if a['id'] == exclude_id:
+                continue
+            r0, c0 = FrontierExplorer.world_to_cell(a['x'], a['y'], ox, oy, res)
+            rows = np.arange(max(0, r0 - n), min(info.height, r0 + n + 1))
+            cols = np.arange(max(0, c0 - n), min(info.width, c0 + n + 1))
+            if rows.size == 0 or cols.size == 0:
+                continue
+            ys = oy + (rows + 0.5) * res - a['y']
+            xs = ox + (cols + 0.5) * res - a['x']
+            inside = (ys[:, None] ** 2 + xs[None, :] ** 2) <= radius ** 2
+            grid[np.ix_(rows, cols)] = np.where(inside, 100, grid[np.ix_(rows, cols)])
+        return grid
+
+    def find_standoff(self, artifact, pose):
+        """Best standoff pose for the artefact, or None if none is reachable on the current map.
+        Other artefacts are obstacles; the target's own disc is left out (it would block the line of
+        sight), but standoffs Nav2 would see as inside the target's disc are dropped."""
+        info = self.map_msg_.info
+        grid = self.planning_grid(exclude_id=artifact['id'])
         standoffs = self.inspection_planner_.standoffs(
             grid, info.resolution, info.origin.position.x, info.origin.position.y,
             (pose.x, pose.y), (artifact['x'], artifact['y']), failed=self.failed_standoffs_)
+        keep_out = self.get_parameter('artifact_obstacle_radius').value + 0.6   # robot radius + margin
+        standoffs = [s for s in standoffs
+                     if math.hypot(s[0] - artifact['x'], s[1] - artifact['y']) >= keep_out]
         return standoffs[0] if standoffs else None
 
     def next_inspection_target(self):
