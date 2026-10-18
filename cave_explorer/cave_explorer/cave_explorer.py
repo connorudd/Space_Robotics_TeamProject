@@ -26,7 +26,7 @@ from visualization_msgs.msg import MarkerArray
 
 import json
 
-from std_msgs.msg import Bool, Header, String
+from std_msgs.msg import Bool, Header, Int32MultiArray, String
 
 try:
     from sensor_msgs_py import point_cloud2   # part of ROS 2 Humble
@@ -58,6 +58,11 @@ def pose2d_to_pose(pose_2d):
     pose.orientation.z = math.sin(pose_2d.theta / 2.0)
 
     return pose
+
+
+# Perception's fixed integer id per artefact type (ARTEFACT_IDS in artefact_perception.py)
+PERCEPTION_TYPES = {1: 'green_alien', 2: 'green_crystals', 3: 'ice_castles', 4: 'mushrooms_blue',
+                    5: 'white_sphere', 6: 'stop_sign'}
 
 
 class PlannerType(Enum):
@@ -232,6 +237,16 @@ class CaveExplorer(Node):
         # (PoseArray, map frame, re-sent every second) plus a Bool while any artefact is in view.
         # These are turned into the same reports as /artifacts: ids are assigned here by position.
         self.declare_parameter('perception_match_radius', 2.0)  # m, same as the Perception merge radius
+        # artefact_location_ids carries one integer type per confirmed position, in the same order as
+        # artefact_locations (Perception's ARTEFACT_IDS table, keyed by class name so it survives retraining).
+        self.perception_ids_ = []         # latest artefact_location_ids
+        self.perception_order_ = []       # our artefact id for each position of the latest artefact_locations
+        self.location_ids_sub_ = self.create_subscription(Int32MultiArray, 'artefact_location_ids',
+                                                          self.artefact_location_ids_callback, 10)
+        # Planning 2 asks to focus on 2 or 3 types the detector handles reliably. Comma-separated type
+        # names, e.g. "green_crystals,white_sphere,stop_sign"; empty = inspect every type.
+        # Every trusted artefact is still an obstacle for Nav2, whatever its type.
+        self.declare_parameter('inspect_types', '')
         self.next_perception_id_ = 0
         self.locations_sub_ = self.create_subscription(PoseArray, 'artefact_locations',
                                                        self.artefact_locations_callback, 10)
@@ -1080,7 +1095,9 @@ class CaveExplorer(Node):
         """Confirmed positions from the Perception node -> reports keyed by a stable id of our own.
         A position within perception_match_radius of a known artefact updates it; otherwise it is new."""
         radius = self.get_parameter('perception_match_radius').value
-        for pose in msg.poses:
+        ids = self.perception_ids_ if len(self.perception_ids_) == len(msg.poses) else []
+        order = []
+        for index, pose in enumerate(msg.poses):
             x, y = pose.position.x, pose.position.y
             best_id, best_d = None, radius
             for artifact_id, a in self.artifacts_.items():
@@ -1091,12 +1108,36 @@ class CaveExplorer(Node):
                 artifact_id = f'p{self.next_perception_id_}'
                 self.next_perception_id_ += 1
                 # Perception only publishes artefacts it has seen at least 3 times, so it is trusted
-                self.artifacts_[artifact_id] = {'id': artifact_id, 'type': 'artefact', 'x': x, 'y': y,
+                artefact_type = PERCEPTION_TYPES.get(ids[index], 'artefact') if ids else 'artefact'
+                self.artifacts_[artifact_id] = {'id': artifact_id, 'type': artefact_type, 'x': x, 'y': y,
                                                 'z': 0.5, 'n_obs': 3, 'last_seen': self.now_sec()}
-                self.get_logger().info(f'New artefact {artifact_id} from Perception at ({x:.1f}, {y:.1f})')
+                self.get_logger().info(f'New artefact {artifact_id} ({artefact_type}) from Perception '
+                                       f'at ({x:.1f}, {y:.1f})')
+                order.append(artifact_id)
             else:
                 # A new dict, not an in-place edit, so the 'target moved' check can compare old and new
                 self.artifacts_[best_id] = {**self.artifacts_[best_id], 'x': x, 'y': y}
+                order.append(best_id)
+        self.perception_order_ = order
+        if ids:
+            self.apply_perception_types(ids)
+
+    def artefact_location_ids_callback(self, msg):
+        """Type of each confirmed artefact, same order as the last artefact_locations. Perception publishes
+        the ids just after the positions, so this usually labels the positions that just arrived."""
+        self.perception_ids_ = list(msg.data)
+        if len(self.perception_ids_) == len(self.perception_order_):
+            self.apply_perception_types(self.perception_ids_)
+
+    def apply_perception_types(self, ids):
+        """Set each Perception artefact's type from its integer id (class by majority vote, so it can change)"""
+        for artifact_id, type_id in zip(self.perception_order_, ids):
+            a = self.artifacts_.get(artifact_id)
+            new_type = PERCEPTION_TYPES.get(type_id, 'artefact')
+            if a is not None and a['type'] != new_type:
+                if a['type'] != 'artefact':
+                    self.get_logger().info(f'Artefact {artifact_id} is now {new_type} (was {a["type"]})')
+                self.artifacts_[artifact_id] = {**a, 'type': new_type}
 
     def artefact_detected_callback(self, msg):
         """Perception sees an artefact right now: mark the known artefacts in the camera's view as seen.
@@ -1117,9 +1158,11 @@ class CaveExplorer(Node):
     def pending_artifacts(self):
         """Artefacts seen often enough to trust, not yet inspected or given up on"""
         min_obs = self.get_parameter('min_observations').value
+        wanted = {t.strip() for t in self.get_parameter('inspect_types').value.split(',') if t.strip()}
         return [a for a in self.artifacts_.values()
                 if a['id'] not in self.inspected_ and a['id'] not in self.abandoned_
-                and a.get('n_obs', min_obs) >= min_obs]
+                and a.get('n_obs', min_obs) >= min_obs
+                and (not wanted or a['type'] in wanted)]
 
     def trusted_artifacts(self):
         """Artefacts seen often enough to act on (inspected or not)"""
