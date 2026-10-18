@@ -1,34 +1,4 @@
 #!/usr/bin/env python3
-"""
-label_tool.py - quick bounding-box labeller for a folder-per-class image dataset.
-
-Expected layout (folder names become the class names, sorted alphabetically):
-
-    cave_dataset/
-        alien/       img_00012.png ...
-        mushroom/    ...
-        stop_sign/   ...
-        negatives/   ...   <- skipped, no boxes needed
-
-For every image it writes a YOLO label file beside it (img_00012.png -> img_00012.txt),
-one line per box:  <class_id> <x_centre> <y_centre> <width> <height>  (normalised 0-1)
-Class IDs are saved to classes.txt. Don't add or rename class folders after you start
-labelling, or the IDs will shift.
-
-Usage:
-    python3 label_tool.py ~/cave_dataset
-    python3 label_tool.py ~/cave_dataset --relabel     # also redo images that already have labels
-
-Controls
-    Drawing a box:   drag with the mouse, then ENTER or SPACE to confirm
-                     press c (or ESC) when there are no more boxes on this image
-    Choosing class:  ENTER -> the folder's class
-                     0-9   -> a different class id (for other artefacts in the same frame)
-    Finished image:  any key -> save and go to the next image
-                     u       -> redo this image
-                     x       -> reject a bad frame (moved to _rejected/, not labelled)
-                     q       -> save and quit (run again later to carry on where you left off)
-"""
 
 import argparse
 import shutil
@@ -97,11 +67,26 @@ def main():
     args = parser.parse_args()
 
     root = args.root.expanduser()
-    class_dirs = sorted(d for d in root.iterdir()
-                        if d.is_dir() and d.name != args.negatives and not d.name.startswith('_'))
-    classes = [d.name for d in class_dirs]
-    if not classes:
+    folder_names = sorted(d.name for d in root.iterdir()
+                          if d.is_dir() and d.name != args.negatives and not d.name.startswith('_'))
+    if not folder_names:
         raise SystemExit(f'No class folders found in {root}')
+
+    # Keep the class IDs already used in existing labels: classes from classes.txt keep their
+    # position, and any new folders (e.g. a newly added artefact) are appended at the end.
+    classes_file = root / 'classes.txt'
+    existing = []
+    if classes_file.exists():
+        existing = [c.strip() for c in classes_file.read_text().splitlines() if c.strip()]
+    missing = [c for c in existing if c not in folder_names]
+    if missing:
+        raise SystemExit(f'classes.txt lists {missing} but there is no folder for them. Restore the '
+                         f'folder(s), or delete classes.txt and ALL label .txt files to start over.')
+    new = [c for c in folder_names if c not in existing]
+    classes = existing + new
+    class_dirs = [root / c for c in classes]
+    if existing and new:
+        print(f'New class(es) {new} added after the existing ones - existing labels are unchanged.')
 
     (root / 'classes.txt').write_text('\n'.join(classes) + '\n')
     print('Class IDs (saved to classes.txt):')
