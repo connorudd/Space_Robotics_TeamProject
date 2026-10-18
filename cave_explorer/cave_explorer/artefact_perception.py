@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""
-artefact_perception.py - standalone perception node for the cave explorer (Perception 1, 2 and 3).
-
-Runs separately from cave_explorer.py (planning) and doesn't send or depend on navigation goals,
-so it works the same whether the robot is driven by Nav2, by teleop, or not moving at all.
-
-    Perception 1  saves selected camera frames for the dataset (toggle with the save_images parameter)
-    Perception 2  detects artefacts with the trained YOLO model and publishes the annotated image
-    Perception 3  localises each detection with the depth camera, merges repeated sightings,
-                  and publishes RViz markers
-
-Run:   ros2 launch cave_explorer perception.launch.py
-
-Published topics
-    detections_image        sensor_msgs/Image        camera image with bounding boxes (shown in RViz)
-    marker_array_artifacts  visualization_msgs/MarkerArray   confirmed artefacts (sphere + label)
-    artefact_detected       std_msgs/Bool             True while an artefact is in view
-    artefact_locations      geometry_msgs/PoseArray   confirmed artefact positions in the map frame
-                                                      (for planning: e.g. drive to / avoid revisiting)
-"""
 
 import csv
 import math
@@ -31,17 +11,22 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, Pose, PoseArray
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32, Int32MultiArray
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from ultralytics import YOLO
 from visualization_msgs.msg import Marker, MarkerArray
 
-
-#######################################################
-# Perception 3 helpers (no ROS dependencies, so they can be tested offline)
+try:
+    from cave_explorer.degradations import DEGRADATIONS, degrade, enhance
+except ImportError:
+    try:
+        from degradations import DEGRADATIONS, degrade, enhance
+    except ImportError:
+        DEGRADATIONS, degrade, enhance = (), None, None
 
 def depth_in_box(depth_m, box, shrink=0.4, min_valid_fraction=0.1, max_depth=8.0):
     """
@@ -66,7 +51,7 @@ def depth_in_box(depth_m, box, shrink=0.4, min_valid_fraction=0.1, max_depth=8.0
 
 
 def detection_to_map(u, depth, fx, cx, robot_x, robot_y, robot_theta,
-                     camera_x_offset=0.5, camera_y_offset=0.0):
+                     camera_x_offset=0.0, camera_y_offset=0.0):
     """
     Convert a detection to a 2D map position.
     u: horizontal pixel of the box centre. depth: distance along the camera's forward axis (m).
@@ -95,7 +80,7 @@ class ArtefactMap:
         self.merge_radius = merge_radius
         self.min_observations = min_observations
         self.max_obs = max_obs_per_artefact
-        self.artefacts = []  # dicts: {'obs': [(x, y)], 'votes': {class: count}, 'count': n}
+        self.artefacts = [] 
 
     @staticmethod
     def _position(a):
@@ -160,10 +145,23 @@ CLASS_COLOURS = {
     'ice_castles': (0.7, 0.9, 1.0),
     'mushrooms_blue': (0.2, 0.4, 1.0),
     'white_sphere': (1.0, 1.0, 1.0),
+    'stop_sign': (1.0, 0.1, 0.1),
 }
 
+# Fixed integer ID for each artefact type, published on artefact_id / artefact_location_ids.
+# Keyed by class NAME, so the IDs stay the same even if the YOLO class order changes after retraining.
+# Share this table with whoever uses the topics (e.g. Planning 2). Unknown classes get -1.
+ARTEFACT_IDS = {
+    'green_alien': 1,
+    'green_crystals': 2,
+    'ice_castles': 3,
+    'mushrooms_blue': 4,
+    'white_sphere': 5,
+    'stop_sign': 6,
+}
 
-#######################################################
+def artefact_id(label):
+    return ARTEFACT_IDS.get(label, -1)
 
 class ArtefactPerception(Node):
     def __init__(self):
@@ -175,7 +173,7 @@ class ArtefactPerception(Node):
 
         # Topics
         self.declare_parameter('image_topic', 'camera/image')
-        self.declare_parameter('depth_topic', 'camera/depth/image')
+        self.declare_parameter('depth_topic', 'camera/depth_image')
         self.declare_parameter('camera_info_topic', 'camera/camera_info')
 
         # Perception 1: dataset collection. Toggle while running:
@@ -218,15 +216,39 @@ class ArtefactPerception(Node):
         self.detections_image_pub_ = self.create_publisher(Image, 'detections_image', 1)
         self.marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_artifacts', 10)
         self.detected_pub_ = self.create_publisher(Bool, 'artefact_detected', 10)
-        self.locations_pub_ = self.create_publisher(PoseArray, 'artefact_locations', 10)
 
-        # Subscribers
+        # Advanced 1: robust perception. Change while running, e.g.
+        #   ros2 param set /artefact_perception_node degradation dust
+        #   ros2 param set /artefact_perception_node degradation_level 2
+        #   ros2 param set /artefact_perception_node enhance true
+        self.declare_parameter('degradation', 'none')   # none, dust, low_light, motion_blur, low_res, dirty_lens
+        self.declare_parameter('degradation_level', 0)  # 0 (off) to 3 (severe)
+        self.declare_parameter('enhance', False)        # preprocessing before detection
+        self.degraded_image_pub_ = self.create_publisher(Image, 'degraded_image', 1)
+        self.enhanced_image_pub_ = self.create_publisher(Image, 'enhanced_image', 1)
+        self.degradation_rng_ = np.random.default_rng()
+        self.stats_setting_ = None
+        self.locations_pub_ = self.create_publisher(PoseArray, 'artefact_locations', 10)
+        self.id_pub_ = self.create_publisher(Int32, 'artefact_id', 10)
+        self.location_ids_pub_ = self.create_publisher(Int32MultiArray, 'artefact_location_ids', 10)
+        unknown = [n for n in self.yolo_model_.names.values() if n not in ARTEFACT_IDS]
+        if unknown:
+            self.get_logger().warn(f'No integer ID for classes {unknown} (published as -1) - add them to ARTEFACT_IDS')
+
+        # Subscribers. Sensor-data QoS (best effort) connects to both reliable and best-effort
+        # publishers; a default (reliable) subscriber silently receives nothing from a best-effort
+        # publisher, which is a common reason a depth topic "doesn't arrive".
+        image_topic = self.get_parameter('image_topic').value
+        depth_topic = self.get_parameter('depth_topic').value
+        info_topic = self.get_parameter('camera_info_topic').value
         self.image_sub_ = self.create_subscription(
-            Image, self.get_parameter('image_topic').value, self.image_callback, 1)
+            Image, image_topic, self.image_callback, qos_profile_sensor_data)
         self.depth_sub_ = self.create_subscription(
-            Image, self.get_parameter('depth_topic').value, self.depth_callback, 1)
+            Image, depth_topic, self.depth_callback, qos_profile_sensor_data)
         self.camera_info_sub_ = self.create_subscription(
-            CameraInfo, self.get_parameter('camera_info_topic').value, self.camera_info_callback, 1)
+            CameraInfo, info_topic, self.camera_info_callback, qos_profile_sensor_data)
+        self.get_logger().info(f'Subscribed to image: {image_topic}, depth: {depth_topic}, '
+                               f'camera_info: {info_topic}')
 
         # Re-publish markers and locations every second so RViz / late subscribers always have them
         self.publish_timer_ = self.create_timer(1.0, self.publish_artefacts)
@@ -261,6 +283,12 @@ class ArtefactPerception(Node):
         if depth.dtype == np.uint16:
             depth = depth.astype(np.float32) / 1000.0   # 16-bit depth is in millimetres
         self.latest_depth_ = np.asarray(depth, dtype=np.float32)
+        if self.latest_depth_stamp_ is None:
+            valid = self.latest_depth_[np.isfinite(self.latest_depth_) & (self.latest_depth_ > 0)]
+            rng = f'{valid.min():.2f}-{valid.max():.2f}' if valid.size else 'no valid pixels'
+            self.get_logger().info(
+                f'First depth image received: {depth_msg.width}x{depth_msg.height}, '
+                f'encoding {depth_msg.encoding}, depth range {rng} m')
         self.latest_depth_stamp_ = depth_msg.header.stamp
 
     def camera_info_callback(self, info_msg):
@@ -277,9 +305,16 @@ class ArtefactPerception(Node):
         if self.get_parameter('save_images').value:
             self.maybe_save_image(image_bgr, image_msg.header.stamp)
 
+        # Advanced 1: degrade (simulated Martian conditions) and optionally enhance before detection.
+        # The original stream stays on camera/image; depth is not degraded.
+        processed = self.apply_robustness(image_bgr, image_msg.header)
+
         # Perception 2: detect
-        detections = self.detect(image_bgr, image_msg.header)
+        detections = self.detect(processed, image_msg.header)
         self.detected_pub_.publish(Bool(data=len(detections) > 0))
+        for d in sorted(detections, key=lambda d: d['confidence'], reverse=True):
+            self.id_pub_.publish(Int32(data=artefact_id(d['class'])))
+        self.update_robustness_stats(detections)
 
         # Perception 3: localise
         if detections:
@@ -316,6 +351,57 @@ class ArtefactPerception(Node):
         self.last_save_time_ = time.time()
         self.last_save_pose_ = pose
         self.get_logger().info(f'Saved {filename}')
+
+    #######################################################
+    # Advanced 1: robust perception
+
+    def apply_robustness(self, image_bgr, header):
+        """Apply the selected degradation (and enhancement), publish both streams, return the result"""
+        kind = self.get_parameter('degradation').value
+        level = self.get_parameter('degradation_level').value
+        if degrade is None:
+            if kind != 'none':
+                self.get_logger().error('degradations.py not installed - degradation disabled',
+                                        throttle_duration_sec=10.0)
+            return image_bgr
+        if kind not in ('none',) + DEGRADATIONS:
+            self.get_logger().error(f'Unknown degradation "{kind}". Options: none, {", ".join(DEGRADATIONS)}',
+                                    throttle_duration_sec=5.0)
+            kind = 'none'
+
+        processed = degrade(image_bgr, kind, level, self.degradation_rng_)
+        msg = self.cv_bridge_.cv2_to_imgmsg(processed, encoding='bgr8')
+        msg.header = header
+        self.degraded_image_pub_.publish(msg)
+
+        if self.get_parameter('enhance').value:
+            processed = enhance(processed)
+            msg = self.cv_bridge_.cv2_to_imgmsg(processed, encoding='bgr8')
+            msg.header = header
+            self.enhanced_image_pub_.publish(msg)
+        return processed
+
+    def update_robustness_stats(self, detections):
+        """
+        Live statistics for the current setting, logged every 50 frames: the fraction of frames with
+        a detection and the mean top confidence. Park the robot facing an artefact and compare settings.
+        """
+        setting = (self.get_parameter('degradation').value,
+                   self.get_parameter('degradation_level').value,
+                   self.get_parameter('enhance').value)
+        if setting != self.stats_setting_:
+            self.stats_setting_, self.stats_frames_, self.stats_hits_, self.stats_conf_ = setting, 0, 0, 0.0
+        self.stats_frames_ += 1
+        if detections:
+            self.stats_hits_ += 1
+            self.stats_conf_ += max(d['confidence'] for d in detections)
+        if self.stats_frames_ % 50 == 0:
+            mean_conf = self.stats_conf_ / self.stats_hits_ if self.stats_hits_ else 0.0
+            kind, level, enh = setting
+            self.get_logger().info(
+                f'[robustness] degradation={kind} level={level} enhance={enh}: artefact detected in '
+                f'{100.0 * self.stats_hits_ / self.stats_frames_:.0f}% of {self.stats_frames_} frames, '
+                f'mean top confidence {mean_conf:.2f}')
 
     #######################################################
     # Perception 2: detection
@@ -356,7 +442,11 @@ class ArtefactPerception(Node):
         # Skip if the depth image is too old to match this colour image
         dt = abs((stamp.sec + stamp.nanosec * 1e-9) -
                  (self.latest_depth_stamp_.sec + self.latest_depth_stamp_.nanosec * 1e-9))
-        if dt > 0.3:
+        if dt > 0.5:
+            self.get_logger().warn(
+                f'Depth and colour images are {dt:.2f} s apart - skipping localisation. If this '
+                f'never goes away, the two cameras use different clocks (check use_sim_time)',
+                throttle_duration_sec=5.0)
             return
 
         pose = self.get_pose_2d(stamp)
@@ -416,6 +506,7 @@ class ArtefactPerception(Node):
             p.orientation.w = 1.0
             poses.poses.append(p)
         self.locations_pub_.publish(poses)
+        self.location_ids_pub_.publish(Int32MultiArray(data=[artefact_id(label) for label, _, _, _ in confirmed]))
 
         # RViz markers
         marker_array = MarkerArray()
@@ -450,7 +541,7 @@ class ArtefactPerception(Node):
             text.pose.orientation.w = 1.0
             text.scale.z = 0.6
             text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-            text.text = f'{label} ({count})'
+            text.text = f'{label} [{artefact_id(label)}] ({count})'
             marker_array.markers.append(text)
 
         if self.get_parameter('show_observations').value:
